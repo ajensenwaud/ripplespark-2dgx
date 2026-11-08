@@ -1,0 +1,736 @@
+From 5ac58a1246cc6131d8689fdf415e4daab795741b Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <5827908+ajensenwaud@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 02:55:27 +1100
+Subject: [PATCH 7/9] ricursive: the drafter cut over both ranks as the target
+ (heads, FFN, fc/o/down inputs; vocab halves' top-k gathered),
+ TF_RICURSIVE_COPY_DRAFTS
+
+---
+ zig/kernels/cuda/ricursive_draft.cu           |   8 +-
+ zig/src/families/ricursive/cuda.zig           |   2 +
+ zig/src/families/ricursive/cuda_draft.zig     | 237 ++++++++++++------
+ .../families/ricursive/cuda_draft_load.zig    |  70 ++++--
+ zig/src/families/ricursive/cuda_forward.zig   |  25 +-
+ zig/src/families/ricursive/cuda_lanes.zig     |   3 +-
+ zig/src/families/ricursive/cuda_native.zig    |   3 +-
+ zig/tests/ricursive_cuda.zig                  |   1 +
+ 8 files changed, 243 insertions(+), 106 deletions(-)
+
+diff --git a/zig/kernels/cuda/ricursive_draft.cu b/zig/kernels/cuda/ricursive_draft.cu
+index b06662412..ecd433e8a 100644
+--- a/zig/kernels/cuda/ricursive_draft.cu
++++ b/zig/kernels/cuda/ricursive_draft.cu
+@@ -31,11 +31,11 @@ extern "C" __global__ void tf_ripd_taps(const float* __restrict__ X, const int*
+   for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = __float2bfloat16_rn(x[i]);
+ }
+ 
+-// Ring rows (start + i) % TR of one slot's tap ring (width bf16 a row) into OUT row i. Grid (rows), 256 threads.
+-extern "C" __global__ void tf_ripd_gather(const __nv_bfloat16* __restrict__ RING, int TR, long long start, int width,
+-                                          __nv_bfloat16* __restrict__ OUT) {
++// Columns [col, col + width) of ring rows (start + i) % TR (rows of stride bf16) into OUT row i. Grid (rows), 256.
++extern "C" __global__ void tf_ripd_gather(const __nv_bfloat16* __restrict__ RING, int TR, long long start, int stride, int col,
++                                          int width, __nv_bfloat16* __restrict__ OUT) {
+   const long long row = (start + blockIdx.x) % TR;
+-  const uint4* src = reinterpret_cast<const uint4*>(RING + row * width);
++  const uint4* src = reinterpret_cast<const uint4*>(RING + row * stride + col);
+   uint4* dst = reinterpret_cast<uint4*>(OUT + (long long)blockIdx.x * width);
+   for (int i = threadIdx.x; i < width / 8; i += blockDim.x) dst[i] = src[i];
+ }
+diff --git a/zig/src/families/ricursive/cuda.zig b/zig/src/families/ricursive/cuda.zig
+index 22f3c16a7..eebed10d6 100644
+--- a/zig/src/families/ricursive/cuda.zig
++++ b/zig/src/families/ricursive/cuda.zig
+@@ -6,6 +6,8 @@ pub const weights = @import("cuda_weights.zig");
+ pub const forward = @import("cuda_forward.zig");
+ pub const Model = forward.Model;
+ pub const native = @import("cuda_native.zig");
++/// Rank 1's drafter calls (set as Model.draft_hook before follow).
++pub const draftFollow = @import("cuda_draft.zig").follow;
+ 
+ /// Bytes this rank's weights take: its share of the cut matrices, plus the bf16 embedding every rank holds whole.
+ pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
+diff --git a/zig/src/families/ricursive/cuda_draft.zig b/zig/src/families/ricursive/cuda_draft.zig
+index 295c15141..4dd5bef36 100644
+--- a/zig/src/families/ricursive/cuda_draft.zig
++++ b/zig/src/families/ricursive/cuda_draft.zig
+@@ -1,9 +1,8 @@
+-//! Ripple's DFlash2 drafter behind lanes.drafter, on rank 0 alone: the target's taps, a 16-row block, its selector's chain.
++//! Ripple's DFlash2 drafter behind lanes.drafter, cut over the ranks as the target: taps, a 16-row block, the selector.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const fwd = @import("cuda_forward.zig");
+-const weights = @import("cuda_weights.zig");
+ const ld = @import("cuda_draft_load.zig");
+ 
+ const dr = lanes.drafter;
+@@ -17,15 +16,17 @@ const hold_streams = 4;
+ const max_block = 16;
+ 
+ /// A stream's context: its layers' key and value rings over positions [begin, end), and the chain it holds.
+-pub const Ctx = struct { ring: cuda.DeviceBuffer, begin: u64 = 0, end: u64 = 0, held: [max_block]u32 = undefined, held_n: usize = 0 };
++pub const Ctx = struct { ring: cuda.DeviceBuffer, id: i32 = 0, begin: u64 = 0, end: u64 = 0, held: [max_block]u32 = undefined, held_n: usize = 0 };
+ 
+-const Bufs = struct { taps: u64, th: u64, thn: u64, ka: u64, va: u64, h: u64, h2: u64, x: u64, xin: u64, dyn: u64, q: u64, kr: u64, vr: u64, qb: u64, kb: u64, vb: u64, att: u64, o: u64, gate: u64, up: u64, act: u64, fin: u64, fin16: u64, logits: u64, hp: u64, pv: u64, pi: u64, pm: u64, pl: u64, po: u64, ids: u64, segs: u64 };
++const Bufs = struct { taps: u64, th: u64, thn: u64, ka: u64, va: u64, h: u64, h2: u64, x: u64, xin: u64, dyn: u64, q: u64, kr: u64, vr: u64, qb: u64, kb: u64, vb: u64, att: u64, o: u64, gate: u64, up: u64, act: u64, fin: u64, fin16: u64, logits: u64, hp: u64, tk: u64, pm: u64, pl: u64, po: u64, ids: u64, segs: u64 };
+ 
+ pub const Draft = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+     m: *fwd.Model,
+-    c: ld.Config,
++    c: ld.Config, // the rank's widths (cuda_draft_load.zig's share)
++    rank: usize,
++    world: usize,
+     w: ld.Weights,
+     k: ld.Kernels,
+     dense: cuda.dense_rows.DenseRows,
+@@ -33,29 +34,34 @@ pub const Draft = struct {
+     plans: std.AutoHashMapUnmanaged([3]u64, cuda.cublaslt.Linear) = .empty,
+     work: u64 = 0,
+     x3: cuda.exl3.Dense, // the head's own EXL3 scratch: the target's captured graphs hold theirs
+-    hw: weights.Weights, // the target's whole head (rank 0's own share holds half the vocabulary)
+-    head: cuda.exl3.Weight,
+     bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
+     b: Bufs = undefined,
+     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
+     pool: std.ArrayList(*Ctx) = .empty,
+-    pv: []f32 = &.{},
+-    pi: []i32 = &.{},
++    by_id: std.AutoHashMapUnmanaged(i32, *Ctx) = .empty, // rank 1: rank 0's contexts by id
++    next_id: i32 = 1,
++    tkh: []u32 = &.{}, // the ranks' top-k slices: values then ids, a rank's after another's
+     hp: []f32 = &.{},
+     step_ms: f64 = 1.0,
+     costs: [fwd.tree_rows]Cost = undefined,
+     n_costs: usize = 0,
+ 
+-    /// The drafter in `dir` over the target `m` (rank 0), with the target's whole head from `target_dir`.
+-    pub fn init(gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, dir: []const u8, target_dir: []const u8) !*Draft {
++    /// The drafter in `dir` over the target `m`, this rank's share; rank 0 first has rank 1 open its own.
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, m: *fwd.Model, dir: []const u8) !*Draft {
+         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+         defer gpa.free(path);
+         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+         defer gpa.free(bytes);
+-        const c = try ld.Config.parse(gpa, bytes, m.c.hidden, m.c.vocab, m.c.layers);
++        const full = try ld.Config.parse(gpa, bytes, m.c.hidden, m.c.vocab, m.c.layers);
++        const world = m.o.place.world;
++        const c = try full.share(world);
++        if (m.rank() == 0 and world > 1) {
++            var h: fwd.Header = .{ .op = @backingInt(fwd.Op.draft_open) };
++            try m.plan(&h);
++        }
+         const d = try gpa.create(Draft);
+         errdefer gpa.destroy(d);
+-        d.* = .{ .gpa = gpa, .io = io, .m = m, .c = c, .w = undefined, .k = undefined, .dense = undefined, .x3 = undefined, .hw = .{ .gpa = gpa }, .head = undefined };
++        d.* = .{ .gpa = gpa, .io = io, .m = m, .c = c, .rank = m.rank(), .world = world, .w = undefined, .k = undefined, .dense = undefined, .x3 = undefined };
+         d.k = try ld.Kernels.load(m.d);
+         errdefer d.k.unload();
+         d.dense = try cuda.dense_rows.DenseRows.load(m.d);
+@@ -67,20 +73,14 @@ pub const Draft = struct {
+             std.log.warn("ricursive: drafter without cuBLASLt ({s}): dense rows", .{@errorName(e)});
+             break :blk null;
+         };
+-        d.w = try ld.Weights.load(gpa, io, m.d, dir, c);
++        d.w = try ld.Weights.load(gpa, io, m.d, dir, full, .{ .rank = d.rank, .world = world });
+         errdefer d.w.deinit();
+-        var ck = try @import("core").Checkpoint.openModel(gpa, io, target_dir);
+-        defer ck.close();
+-        errdefer d.hw.deinit();
+-        d.head = try weights.exl3(&d.hw, m.d, &ck, "lm_head", m.c.vocab, m.c.hidden, .columns, .{});
+         errdefer for (d.bufs.items) |*x| x.free();
+         try d.alloc();
+         d.work = try d.buf(work_bytes);
+-        const n = d.c.block * hold_streams * ld.slices(c.vocab) * c.topk;
+-        d.pv = try gpa.alloc(f32, n);
+-        d.pi = try gpa.alloc(i32, n);
++        d.tkh = try gpa.alloc(u32, world * d.tkWords(c.block * hold_streams));
+         d.hp = try gpa.alloc(f32, d.c.block * hold_streams * c.rank);
+-        std.log.info("ricursive: DFlash2 drafter on rank 0, {d} layers, block {d}, conv {d}, top-{d}, {d:.2} GiB of BF16 weights", .{ c.layers, c.block, c.kernel, c.topk, @as(f64, @floatFromInt(d.w.bytes + d.hw.bytes)) / (1 << 30) });
++        std.log.info("ricursive: DFlash2 drafter, rank {d} of {d}: {d} layers, block {d}, conv {d}, top-{d}, {d:.2} GiB of BF16 weights", .{ d.rank, world, c.layers, c.block, c.kernel, c.topk, @as(f64, @floatFromInt(d.w.bytes)) / (1 << 30) });
+         return d;
+     }
+ 
+@@ -97,7 +97,12 @@ pub const Draft = struct {
+         const B = c.block * hold_streams;
+         const h = c.hidden;
+         const ch = c.chunks();
+-        d.b = .{ .taps = try d.buf(R * c.n_taps * h * 2), .th = try d.buf(R * h * 4), .thn = try d.buf(R * h * 2), .ka = try d.buf(R * c.kvWidth() * 4), .va = try d.buf(R * c.kvWidth() * 4), .h = try d.buf(B * h * 4), .h2 = try d.buf(B * h * 4), .x = try d.buf(B * h * 2), .xin = try d.buf(B * h * 2), .dyn = try d.buf(B * c.dynamic() * 4), .q = try d.buf(B * c.qWidth() * 4), .kr = try d.buf(B * c.kvWidth() * 4), .vr = try d.buf(B * c.kvWidth() * 4), .qb = try d.buf(B * c.qWidth() * 2), .kb = try d.buf(B * c.kvWidth() * 2), .vb = try d.buf(B * c.kvWidth() * 2), .att = try d.buf(B * c.qWidth() * 2), .o = try d.buf(B * h * 4), .gate = try d.buf(B * c.intermediate * 4), .up = try d.buf(B * c.intermediate * 4), .act = try d.buf(B * c.intermediate * 2), .fin = try d.buf(B * h * 2), .fin16 = try d.buf(B * h * 2), .logits = try d.buf(B * c.vocab * 4), .hp = try d.buf(B * c.rank * 4), .pv = try d.buf(B * ld.slices(c.vocab) * c.topk * 4), .pi = try d.buf(B * ld.slices(c.vocab) * c.topk * 4), .pm = try d.buf(B * c.heads * ch * 4), .pl = try d.buf(B * c.heads * ch * 4), .po = try d.buf(B * c.heads * ch * 128 * 4), .ids = try d.buf(B * 4), .segs = try d.buf(hold_streams * @sizeOf(ld.Seg)) };
++        d.b = .{ .taps = try d.buf(R * c.n_taps * h * 2 / d.world), .th = try d.buf(R * h * 4), .thn = try d.buf(R * h * 2), .ka = try d.buf(R * c.kvWidth() * 4), .va = try d.buf(R * c.kvWidth() * 4), .h = try d.buf(B * h * 4), .h2 = try d.buf(B * h * 4), .x = try d.buf(B * h * 2), .xin = try d.buf(B * h * 2), .dyn = try d.buf(B * c.dynamic() * 4), .q = try d.buf(B * c.qWidth() * 4), .kr = try d.buf(B * c.kvWidth() * 4), .vr = try d.buf(B * c.kvWidth() * 4), .qb = try d.buf(B * c.qWidth() * 2), .kb = try d.buf(B * c.kvWidth() * 2), .vb = try d.buf(B * c.kvWidth() * 2), .att = try d.buf(B * c.qWidth() * 2), .o = try d.buf(B * h * 4), .gate = try d.buf(B * c.intermediate * 4), .up = try d.buf(B * c.intermediate * 4), .act = try d.buf(B * c.intermediate * 2), .fin = try d.buf(B * h * 2), .fin16 = try d.buf(B * h * 2), .logits = try d.buf(B * d.m.vr * 4), .hp = try d.buf(B * c.rank * 4), .tk = try d.buf(d.world * d.tkWords(B) * 4), .pm = try d.buf(B * c.heads * ch * 4), .pl = try d.buf(B * c.heads * ch * 4), .po = try d.buf(B * c.heads * ch * 128 * 4), .ids = try d.buf(B * 4), .segs = try d.buf(hold_streams * @sizeOf(ld.Seg)) };
++    }
++
++    /// A rank's top-k words for `rows` rows: values then ids over its vocabulary share's slices.
++    fn tkWords(d: *const Draft, rows: usize) usize {
++        return 2 * rows * ld.slices(d.m.vr) * d.c.topk;
+     }
+ 
+     pub fn deinit(d: *Draft) void {
+@@ -114,10 +119,11 @@ pub const Draft = struct {
+         d.plans.deinit(d.gpa);
+         if (d.lt) |*l| l.close();
+         d.x3.unload();
+-        d.gpa.free(d.pv);
+-        d.gpa.free(d.pi);
++        var bit = d.by_id.valueIterator();
++        while (bit.next()) |x| d.drop(x.*);
++        d.by_id.deinit(d.gpa);
++        d.gpa.free(d.tkh);
+         d.gpa.free(d.hp);
+-        d.hw.deinit();
+         d.w.deinit();
+         d.dense.unload();
+         d.k.unload();
+@@ -132,11 +138,22 @@ pub const Draft = struct {
+     fn create(d: *Draft) !*Ctx {
+         const x = try d.gpa.create(Ctx);
+         errdefer d.gpa.destroy(x);
+-        x.* = .{ .ring = try cuda.DeviceBuffer.alloc(d.m.d, d.c.ringBytes()) };
++        x.* = .{ .ring = try cuda.DeviceBuffer.alloc(d.m.d, d.c.ringBytes()), .id = d.next_id };
++        d.next_id += 1;
+         try x.ring.fill8(0, null);
+         return x;
+     }
+ 
++    /// Rank 1: rank 0's context `id` (made on first use).
++    fn ctxOf(d: *Draft, id: i32) !*Ctx {
++        if (d.by_id.get(id)) |x| return x;
++        const x = try d.create();
++        errdefer d.drop(x);
++        x.id = id;
++        try d.by_id.put(d.gpa, id, x);
++        return x;
++    }
++
+     /// `n` contexts ready for the streams the server admits.
+     pub fn reserve(d: *Draft, n: usize) !void {
+         while (d.pool.items.len < n) try d.pool.append(d.gpa, try d.create());
+@@ -157,11 +174,16 @@ pub const Draft = struct {
+         return x.ring.ptr + layer * 2 * d.c.ringRows() * d.c.kvWidth() * 2;
+     }
+ 
+-    /// Target rows [start, start + n) from a slot's tap ring into the context (rows past the widest window dropped).
+-    fn absorb(d: *Draft, x: *Ctx, ring: u64, start_: u64, n_: usize) !void {
+-        const c = d.c;
+-        const s = d.m.stream;
+-        const most = c.ringRows() - c.block;
++    /// out = x through a row-cut matrix: this rank's partial, then the ranks' partials added in rank order.
++    fn mmSum(d: *Draft, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize) !void {
++        if (d.world == 1) return d.mm(x, w, out, rows, n, k);
++        try d.mm(x, w, d.m.b.parts + d.rank * rows * n * 4, rows, n, k);
++        try d.m.sumRanks(out, rows * n * 4);
++    }
++
++    /// Rank 0: target rows [start, start + n) of tap slot `slot` into the context (past the widest window dropped).
++    fn absorb(d: *Draft, x: *Ctx, slot: usize, start_: u64, n_: usize) !void {
++        const most = d.c.ringRows() - d.c.block;
+         var start = start_;
+         var n = n_;
+         if (n == 0) return;
+@@ -174,42 +196,77 @@ pub const Draft = struct {
+         }
+         while (n > 0) {
+             const rows = @min(n, fwd.max_rows);
+-            try d.k.gather(s, ring, fwd.tap_rows, start, c.n_taps * c.hidden, d.b.taps, rows);
+-            try d.mm(d.b.taps, d.w.fc, d.b.th, rows, c.hidden, c.n_taps * c.hidden);
+-            try d.k.rms(s, d.b.th, d.w.hidden_norm, d.b.thn, c.hidden, c.eps, 0, 0, rows);
+-            for (d.w.layers[0..c.layers], 0..) |l, i| {
+-                try d.mm(d.b.thn, l.k, d.b.ka, rows, c.kvWidth(), c.hidden);
+-                try d.mm(d.b.thn, l.v, d.b.va, rows, c.kvWidth(), c.hidden);
+-                const rk = d.ringK(x, i);
+-                try d.k.kvPut(s, d.b.ka, d.b.va, l.k_norm, rk, rk + c.ringRows() * c.kvWidth() * 2, c, start, c.rope[i], rows);
++            if (start + rows > x.begin + most) x.begin = start + rows - most;
++            if (d.world > 1) {
++                var h: fwd.Header = .{ .op = @backingInt(fwd.Op.draft_absorb), .slot = x.id, .a = @intCast(slot), .p0 = @intCast(start), .n = @intCast(rows), .b = @intCast(x.begin) };
++                try d.m.plan(&h);
+             }
++            try d.absorbRows(x, slot, start, rows);
+             start += rows;
+             n -= rows;
+-            x.end = start;
+         }
+-        if (x.end - x.begin > most) x.begin = x.end - most;
+     }
+ 
+-    /// One block a stream (pending then masks) through the drafter; each stream's chain into its context.
++    /// Every rank: tap rows [start, start + rows) of `slot` through fc and each layer's keys and values into x's rings.
++    fn absorbRows(d: *Draft, x: *Ctx, slot: usize, start: u64, rows: usize) !void {
++        const c = d.c;
++        const s = d.m.stream;
++        const stride = c.n_taps * c.hidden;
++        const kc = stride / d.world;
++        try d.k.gather(s, d.m.tap_ring + slot * fwd.tap_rows * stride * 2, fwd.tap_rows, start, stride, d.rank * kc, kc, d.b.taps, rows);
++        try d.mmSum(d.b.taps, d.w.fc, d.b.th, rows, c.hidden, kc);
++        try d.k.rms(s, d.b.th, d.w.hidden_norm, d.b.thn, c.hidden, c.eps, 0, 0, rows);
++        for (d.w.layers[0..c.layers], 0..) |l, i| {
++            try d.mm(d.b.thn, l.k, d.b.ka, rows, c.kvWidth(), c.hidden);
++            try d.mm(d.b.thn, l.v, d.b.va, rows, c.kvWidth(), c.hidden);
++            const rk = d.ringK(x, i);
++            try d.k.kvPut(s, d.b.ka, d.b.va, l.k_norm, rk, rk + c.ringRows() * c.kvWidth() * 2, c, start, c.rope[i], rows);
++        }
++        x.end = start + rows;
++    }
++
++    /// Rank 0: one block a stream (pending then masks) on every rank; each stream's chain into its context.
+     fn hold(d: *Draft, items: []const dr.Hold, ctxs: []const *Ctx) !void {
++        var h: fwd.Header = .{ .op = @backingInt(fwd.Op.draft_hold), .ns = @intCast(items.len) };
++        for (items, ctxs, 0..) |it, x, i| {
++            const p = it.position - 1; // the pending token's position: the context holds every row before it
++            if (x.end > p) x.end = p;
++            if (x.begin > x.end) x.begin = x.end;
++            h.streams[i] = .{ x.id, @intCast(it.pending), @intCast(p), @intCast(x.begin) };
++        }
++        if (d.world > 1) try d.m.plan(&h);
++        try d.holdRun(&h, ctxs);
++        const c = d.c;
++        const rows = items.len * (c.block - 1);
++        try d.m.stream.synchronize();
++        const tw = d.tkWords(rows);
++        try (cuda.DeviceBuffer{ .d = d.m.d, .ptr = d.b.tk, .len = d.world * tw * 4 }).download(0, std.mem.sliceAsBytes(d.tkh[0 .. d.world * tw]));
++        try (cuda.DeviceBuffer{ .d = d.m.d, .ptr = d.b.hp, .len = rows * c.rank * 4 }).download(0, std.mem.sliceAsBytes(d.hp[0 .. rows * c.rank]));
++        for (items, ctxs, 0..) |it, x, i| {
++            d.chain(rows, i * (c.block - 1), it.pending, x.held[0 .. c.block - 1]);
++            x.held_n = c.block - 1;
++        }
++    }
++
++    /// Every rank: the plan's blocks through its share; the head's top-k slices gathered on rank 0 (with the selector's).
++    fn holdRun(d: *Draft, hw: *const fwd.Header, ctxs: []const *Ctx) !void {
+         const c = d.c;
+         const m = d.m;
+         const s = m.stream;
+         const b = &d.b;
+-        const B = items.len * c.block;
++        const ns: usize = @intCast(hw.ns);
++        const B = ns * c.block;
+         var ids: [hold_streams * max_block]i32 = undefined;
+         var segs: [hold_streams]ld.Seg = undefined;
+-        for (items, ctxs, 0..) |it, x, i| {
+-            const p = it.position - 1; // the pending token's position: the context holds every row before it
+-            if (x.end > p) x.end = p;
+-            if (x.begin > x.end) x.begin = x.end;
+-            ids[i * c.block] = @intCast(it.pending);
++        for (0..ns) |i| {
++            const e = hw.streams[i];
++            ids[i * c.block] = e[1];
+             @memset(ids[i * c.block + 1 ..][0 .. c.block - 1], @intCast(c.mask));
+-            segs[i] = .{ .ring = x.ring.ptr, .begin = @intCast(x.begin), .position = @intCast(p) };
++            segs[i] = .{ .ring = ctxs[i].ring.ptr, .begin = e[3], .position = e[2] };
+         }
+         try s.synchronize();
+         try m.up(b.ids, std.mem.sliceAsBytes(ids[0..B]));
+-        try m.up(b.segs, std.mem.sliceAsBytes(segs[0..items.len]));
++        try m.up(b.segs, std.mem.sliceAsBytes(segs[0..ns]));
+         const h = c.hidden;
+         try d.k.embed(s, b.ids, m.w.embed, b.h, h, B);
+         for (d.w.layers[0..c.layers], 0..) |l, i| {
+@@ -223,7 +280,7 @@ pub const Draft = struct {
+             try d.k.heads(s, b.kr, c.kvWidth(), l.k_norm, b.kb, c.kv_heads, b.segs, c, c.rope[i], B);
+             try d.k.f2b(s, b.vr, b.vb, B * c.kvWidth());
+             try d.k.attention(s, b.qb, b.kb, b.vb, b.segs, c, i, .{ b.pm, b.pl, b.po }, b.att, B);
+-            try d.mm(b.att, l.o, b.o, B, h, c.qWidth());
++            try d.mmSum(b.att, l.o, b.o, B, h, c.qWidth());
+             try d.k.convOut(s, b.o, b.dyn, l.attn_base, b.h, b.h2, c, B);
+             try d.k.rms(s, b.h2, l.post_norm, b.x, h, c.eps, 0, 0, B);
+             try d.mm(b.x, l.mlp_conv, b.dyn, B, c.dynamic(), h);
+@@ -231,23 +288,19 @@ pub const Draft = struct {
+             try d.mm(b.xin, l.gate, b.gate, B, c.intermediate, h);
+             try d.mm(b.xin, l.up, b.up, B, c.intermediate, h);
+             try d.k.silu(s, b.gate, b.up, b.act, B * c.intermediate);
+-            try d.mm(b.act, l.down, b.o, B, h, c.intermediate);
++            try d.mmSum(b.act, l.down, b.o, B, h, c.intermediate);
+             try d.k.convOut(s, b.o, b.dyn, l.mlp_base, b.h2, b.h, c, B);
+         }
+-        const rows = items.len * (c.block - 1); // each block's mask rows: its drafts
+-        try d.k.rms(s, b.h, d.w.final_norm, b.fin, h, c.eps, 0, c.block, rows);
++        const rows = ns * (c.block - 1); // each block's mask rows: its drafts
+         try d.k.rms(s, b.h, d.w.final_norm, b.fin16, h, c.eps, 1, c.block, rows);
+-        try d.x3.prompt(s, d.head, b.fin16, .f16, rows, b.logits, .f32);
+-        try d.k.topk(s, b.logits, c.vocab, c.topk, b.pv, b.pi, rows);
+-        try d.mm(b.fin, d.w.selector, b.hp, rows, c.rank, h);
+-        try s.synchronize();
+-        const per = ld.slices(c.vocab) * c.topk;
+-        try (cuda.DeviceBuffer{ .d = m.d, .ptr = b.pv, .len = rows * per * 4 }).download(0, std.mem.sliceAsBytes(d.pv[0 .. rows * per]));
+-        try (cuda.DeviceBuffer{ .d = m.d, .ptr = b.pi, .len = rows * per * 4 }).download(0, std.mem.sliceAsBytes(d.pi[0 .. rows * per]));
+-        try (cuda.DeviceBuffer{ .d = m.d, .ptr = b.hp, .len = rows * c.rank * 4 }).download(0, std.mem.sliceAsBytes(d.hp[0 .. rows * c.rank]));
+-        for (items, ctxs, 0..) |it, x, i| {
+-            d.chain(i * (c.block - 1), it.pending, x.held[0 .. c.block - 1]);
+-            x.held_n = c.block - 1;
++        try d.x3.prompt(s, m.w.head, b.fin16, .f16, rows, b.logits, .f32); // this rank's vocabulary share
++        const tw = d.tkWords(rows);
++        const mine = b.tk + d.rank * tw * 4;
++        try d.k.topk(s, b.logits, m.vr, c.topk, mine, mine + tw * 2, rows);
++        if (d.world > 1) try m.group.?.allGather(s, mine, b.tk, tw * 4);
++        if (d.rank == 0) {
++            try d.k.rms(s, b.h, d.w.final_norm, b.fin, h, c.eps, 0, c.block, rows);
++            try d.mm(b.fin, d.w.selector, b.hp, rows, c.rank, h);
+         }
+     }
+ 
+@@ -255,17 +308,26 @@ pub const Draft = struct {
+         return @bitCast(@as(u32, v) << 16);
+     }
+ 
+-    /// Rows row0.. of the last hold: each row's best candidate after the one before (the selector's walk).
+-    fn chain(d: *const Draft, row0: usize, pending: u32, out: []u32) void {
++    /// Rows row0.. of the last hold (`rows` in all): each row's best candidate after the one before (the selector's walk).
++    fn chain(d: *const Draft, rows: usize, row0: usize, pending: u32, out: []u32) void {
+         const c = d.c;
+-        const per = ld.slices(c.vocab) * c.topk;
++        const sr = ld.slices(d.m.vr) * c.topk; // a rank's candidates a row
++        const tw = d.tkWords(rows);
+         var pred = pending;
+         for (out, 0..) |*o, r| {
+-            const vals = d.pv[(row0 + r) * per ..][0..per];
+-            const toks = d.pi[(row0 + r) * per ..][0..per];
++            var vals: [2 * ld.slices_most * ld.most_topk]f32 = undefined;
++            var toks: [2 * ld.slices_most * ld.most_topk]i32 = undefined;
++            const per = d.world * sr;
++            for (0..d.world) |q| { // rank q's slices: its values, then its ids (offset to the whole vocabulary)
++                const base = q * tw + (row0 + r) * sr;
++                for (0..sr) |j| {
++                    vals[q * sr + j] = @bitCast(d.tkh[base + j]);
++                    const t: i32 = @bitCast(d.tkh[base + tw / 2 + j]);
++                    toks[q * sr + j] = if (t < 0) -1 else t + @as(i32, @intCast(q * d.m.vr));
++                }
++            }
+             const hp = d.hp[(row0 + r) * c.rank ..][0..c.rank];
+-            // the row's candidates: the slices' best, by value then the lower id
+-            var order: [ld.slices_most * ld.most_topk]u16 = undefined;
++            var order: [2 * ld.slices_most * ld.most_topk]u16 = undefined;
+             for (order[0..per], 0..) |*e, i| e.* = @intCast(i);
+             const By = struct {
+                 v: []const f32,
+@@ -275,7 +337,7 @@ pub const Draft = struct {
+                     return x.v[a] > x.v[b] or (x.v[a] == x.v[b] and x.t[a] < x.t[b]);
+                 }
+             };
+-            std.sort.pdq(u16, order[0..per], By{ .v = vals, .t = toks }, By.lt);
++            std.sort.pdq(u16, order[0..per], By{ .v = vals[0..per], .t = toks[0..per] }, By.lt);
+             var best_score = -std.math.inf(f32);
+             var best: u32 = pending;
+             for (order[0..c.topk]) |e| {
+@@ -310,14 +372,14 @@ pub const Draft = struct {
+         }
+         d.n_costs = fwd.tree_rows;
+         const x = try d.create();
+-        defer d.drop(x);
+         var best = std.math.inf(f64);
+         for (0..4) |_| {
+-            x.* = .{ .ring = x.ring, .end = 1 };
++            x.* = .{ .ring = x.ring, .id = x.id, .end = 1 };
+             const t0 = std.Io.Clock.awake.now(d.io);
+             try d.hold(&.{.{ .stream = undefined, .pending = 1000, .position = 2, .depth = @intCast(d.c.block - 1) }}, &.{x});
+             best = @min(best, ms(d.io, t0));
+         }
++        try d.pool.append(d.gpa, x);
+         d.step_ms = best / @as(f64, @floatFromInt(d.c.block - 1));
+         // TF_RIPPLE_DRAFT_STEP_MS: the round loop's price of one more draft (a block costs the same at any depth)
+         if (std.c.getenv("TF_RIPPLE_DRAFT_STEP_MS")) |v| d.step_ms = std.fmt.parseFloat(f64, std.mem.span(v)) catch d.step_ms;
+@@ -379,7 +441,8 @@ pub const Draft = struct {
+                     start = from;
+                 }
+             }
+-            try d.absorb(x, it.features.buffer, start, @intCast(n));
++            const row = fwd.tap_rows * d.c.n_taps * d.c.hidden * 2;
++            try d.absorb(x, @intCast((it.features.buffer - d.m.tap_ring) / row), start, @intCast(n));
+         }
+     }
+ 
+@@ -410,6 +473,26 @@ pub const Draft = struct {
+     }
+ };
+ 
++/// Rank 1's side of rank 0's drafter plan words (Model.draft_hook): opens its share, absorbs and holds by context id.
++pub fn follow(m: *fwd.Model, h: *const fwd.Header) anyerror!void {
++    if (h.op == @backingInt(fwd.Op.draft_open)) {
++        const dir = std.c.getenv("TF_RICURSIVE_DRAFTER") orelse return error.RicursiveNoDrafterDir;
++        if (m.draft_ptr != null) return error.RicursiveDrafterOpen;
++        m.draft_ptr = try Draft.init(m.gpa, m.io, m, std.mem.span(dir));
++        return;
++    }
++    const d: *Draft = @ptrCast(@alignCast(m.draft_ptr orelse return error.RicursiveNoDrafter));
++    if (h.op == @backingInt(fwd.Op.draft_absorb)) {
++        const x = try d.ctxOf(h.slot);
++        x.begin = @intCast(h.b);
++        return d.absorbRows(x, @intCast(h.a), @intCast(h.p0), @intCast(h.n));
++    }
++    if (h.ns <= 0 or h.ns > hold_streams) return error.RicursiveRows;
++    var ctxs: [hold_streams]*Ctx = undefined;
++    for (ctxs[0..@intCast(h.ns)], 0..) |*x, i| x.* = try d.ctxOf(h.streams[i][0]);
++    try d.holdRun(h, ctxs[0..@intCast(h.ns)]);
++}
++
+ /// Acceptance by depth until a stream has its own (a prior: the round loop replaces it with what it measures).
+ const prior = [_]f64{ 0.8, 0.7, 0.62, 0.56, 0.5, 0.46, 0.42, 0.39, 0.36, 0.34, 0.32, 0.3, 0.28, 0.27, 0.26 };
+ 
+diff --git a/zig/src/families/ricursive/cuda_draft_load.zig b/zig/src/families/ricursive/cuda_draft_load.zig
+index 4754c8d41..628fff127 100644
+--- a/zig/src/families/ricursive/cuda_draft_load.zig
++++ b/zig/src/families/ricursive/cuda_draft_load.zig
+@@ -48,6 +48,15 @@ pub const Config = struct {
+     pub fn ringBytes(c: Config) usize {
+         return c.layers * 2 * c.ringRows() * c.kvWidth() * 2;
+     }
++    /// The rank's widths: its query and key heads and FFN columns (the rest stays whole).
++    pub fn share(c: Config, world: usize) !Config {
++        if (c.heads % world != 0 or c.kv_heads % world != 0 or c.intermediate % world != 0 or (c.n_taps * c.hidden) % world != 0) return error.UnsupportedDraftConfig;
++        var r = c;
++        r.heads /= world;
++        r.kv_heads /= world;
++        r.intermediate /= world;
++        return r;
++    }
+     pub fn chunks(c: Config) usize {
+         return (c.ringRows() + 255) / 256;
+     }
+@@ -120,15 +129,33 @@ pub const Weights = struct {
+         w.gpa.free(w.successor);
+     }
+ 
+-    fn dev(w: *Weights, d: *const cuda.Driver, ck: *core.Checkpoint, key: []const u8, shape: []const usize) !u64 {
+-        const t = try ck.expect(key, .bf16, shape);
++    fn up(w: *Weights, d: *const cuda.Driver, bytes: []const u8) !u64 {
+         try w.bufs.ensureUnusedCapacity(w.gpa, 1);
+-        const b = try cuda.DeviceBuffer.fromHost(d, t.bytes);
++        const b = try cuda.DeviceBuffer.fromHost(d, bytes);
+         w.bufs.appendAssumeCapacity(b);
+-        w.bytes += t.bytes.len;
++        w.bytes += bytes.len;
+         return b.ptr;
+     }
+ 
++    fn dev(w: *Weights, d: *const cuda.Driver, ck: *core.Checkpoint, key: []const u8, shape: []const usize) !u64 {
++        return w.up(d, (try ck.expect(key, .bf16, shape)).bytes);
++    }
++
++    /// A [n, k] matrix's share at `cut`: its output rows (.rows) or its input columns (.columns) [lo, hi) for the rank.
++    fn part(w: *Weights, d: *const cuda.Driver, ck: *core.Checkpoint, key: []const u8, n: usize, k: usize, side: enum { rows, columns }, cut: Cut) !u64 {
++        const t = try ck.expect(key, .bf16, &.{ n, k });
++        if (cut.world == 1) return w.up(d, t.bytes);
++        if (side == .rows) {
++            const per = n / cut.world;
++            return w.up(d, t.bytes[cut.rank * per * k * 2 ..][0 .. per * k * 2]);
++        }
++        const per = k / cut.world;
++        const g = try w.gpa.alloc(u8, n * per * 2);
++        defer w.gpa.free(g);
++        for (0..n) |r| @memcpy(g[r * per * 2 ..][0 .. per * 2], t.bytes[(r * k + cut.rank * per) * 2 ..][0 .. per * 2]);
++        return w.up(d, g);
++    }
++
+     fn host(w: *Weights, ck: *core.Checkpoint, key: []const u8, shape: []const usize) ![]u16 {
+         const t = try ck.expect(key, .bf16, shape);
+         const out = try w.gpa.alloc(u16, t.bytes.len / 2);
+@@ -136,18 +163,21 @@ pub const Weights = struct {
+         return out;
+     }
+ 
+-    pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, c: Config) !Weights {
++    /// The whole drafter `c` (full widths), each rank's share as the target's cuts (heads, FFN, fc and o/down inputs).
++    pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, c: Config, cut: Cut) !Weights {
+         var ck = try core.Checkpoint.openModel(gpa, io, dir);
+         defer ck.close();
+         var w: Weights = .{ .gpa = gpa };
+         errdefer w.deinit();
+         const h = c.hidden;
+-        w.fc = try w.dev(d, &ck, "fc.weight", &.{ h, c.n_taps * h });
++        w.fc = try w.part(d, &ck, "fc.weight", h, c.n_taps * h, .columns, cut);
+         w.hidden_norm = try w.dev(d, &ck, "hidden_norm.weight", &.{h});
+         w.final_norm = try w.dev(d, &ck, "norm.weight", &.{h});
+-        w.selector = try w.dev(d, &ck, "candidate_selector.hidden_projection.weight", &.{ c.rank, h });
+-        w.predecessor = try w.host(&ck, "candidate_selector.predecessor_codebook", &.{ c.vocab, c.rank });
+-        w.successor = try w.host(&ck, "candidate_selector.successor_codebook", &.{ c.vocab, c.rank });
++        if (cut.rank == 0) {
++            w.selector = try w.dev(d, &ck, "candidate_selector.hidden_projection.weight", &.{ c.rank, h });
++            w.predecessor = try w.host(&ck, "candidate_selector.predecessor_codebook", &.{ c.vocab, c.rank });
++            w.successor = try w.host(&ck, "candidate_selector.successor_codebook", &.{ c.vocab, c.rank });
++        }
+         var buf: [96]u8 = undefined;
+         for (w.layers[0..c.layers], 0..) |*l, i| {
+             const N = struct {
+@@ -161,15 +191,15 @@ pub const Weights = struct {
+             l.* = .{
+                 .input_norm = try w.dev(d, &ck, try n.of("input_layernorm.weight"), &.{h}),
+                 .post_norm = try w.dev(d, &ck, try n.of("post_attention_layernorm.weight"), &.{h}),
+-                .q = try w.dev(d, &ck, try n.of("self_attn.q_proj.weight"), &.{ c.qWidth(), h }),
+-                .k = try w.dev(d, &ck, try n.of("self_attn.k_proj.weight"), &.{ c.kvWidth(), h }),
+-                .v = try w.dev(d, &ck, try n.of("self_attn.v_proj.weight"), &.{ c.kvWidth(), h }),
+-                .o = try w.dev(d, &ck, try n.of("self_attn.o_proj.weight"), &.{ h, c.qWidth() }),
++                .q = try w.part(d, &ck, try n.of("self_attn.q_proj.weight"), c.qWidth(), h, .rows, cut),
++                .k = try w.part(d, &ck, try n.of("self_attn.k_proj.weight"), c.kvWidth(), h, .rows, cut),
++                .v = try w.part(d, &ck, try n.of("self_attn.v_proj.weight"), c.kvWidth(), h, .rows, cut),
++                .o = try w.part(d, &ck, try n.of("self_attn.o_proj.weight"), h, c.qWidth(), .columns, cut),
+                 .q_norm = try w.dev(d, &ck, try n.of("self_attn.q_norm.weight"), &.{128}),
+                 .k_norm = try w.dev(d, &ck, try n.of("self_attn.k_norm.weight"), &.{128}),
+-                .gate = try w.dev(d, &ck, try n.of("mlp.gate_proj.weight"), &.{ c.intermediate, h }),
+-                .up = try w.dev(d, &ck, try n.of("mlp.up_proj.weight"), &.{ c.intermediate, h }),
+-                .down = try w.dev(d, &ck, try n.of("mlp.down_proj.weight"), &.{ h, c.intermediate }),
++                .gate = try w.part(d, &ck, try n.of("mlp.gate_proj.weight"), c.intermediate, h, .rows, cut),
++                .up = try w.part(d, &ck, try n.of("mlp.up_proj.weight"), c.intermediate, h, .rows, cut),
++                .down = try w.part(d, &ck, try n.of("mlp.down_proj.weight"), h, c.intermediate, .columns, cut),
+                 .attn_conv = try w.dev(d, &ck, try n.of("attention_conv.kernel_projection.weight"), &.{ c.dynamic(), h }),
+                 .attn_base = try w.dev(d, &ck, try n.of("attention_conv.base_kernel"), &.{ 2, c.kernel, h }),
+                 .mlp_conv = try w.dev(d, &ck, try n.of("mlp_conv.kernel_projection.weight"), &.{ c.dynamic(), h }),
+@@ -180,6 +210,9 @@ pub const Weights = struct {
+     }
+ };
+ 
++/// A rank's share of the drafter: TF_RICURSIVE_RANK of TF_RICURSIVE_WORLD, as the target's.
++pub const Cut = struct { rank: usize = 0, world: usize = 1 };
++
+ /// A hold's stream as the attention and head kernels read it (ricursive_draft.cu's Seg).
+ pub const Seg = extern struct { ring: u64, begin: i64, position: i64 };
+ 
+@@ -215,8 +248,9 @@ pub const Kernels = struct {
+     pub fn taps(k: *const Kernels, s: cuda.Stream, x: u64, pos: u64, slots: u64, ring: u64, tr: usize, ntaps: usize, tap: usize, h: usize, rows: usize) !void {
+         try go(k.f.taps, s, .{ rows, 1, 1 }, 256, 0, .{ x, pos, slots, ring, @as(i32, @intCast(tr)), @as(i32, @intCast(ntaps)), @as(i32, @intCast(tap)), @as(i32, @intCast(h)) });
+     }
+-    pub fn gather(k: *const Kernels, s: cuda.Stream, ring: u64, tr: usize, start: u64, width: usize, out: u64, rows: usize) !void {
+-        try go(k.f.gather, s, .{ rows, 1, 1 }, 256, 0, .{ ring, @as(i32, @intCast(tr)), @as(i64, @intCast(start)), @as(i32, @intCast(width)), out });
++    /// Columns [col, col + width) of tap rows start.. (rows of `stride` bf16) into OUT rows of `width`.
++    pub fn gather(k: *const Kernels, s: cuda.Stream, ring: u64, tr: usize, start: u64, stride: usize, col: usize, width: usize, out: u64, rows: usize) !void {
++        try go(k.f.gather, s, .{ rows, 1, 1 }, 256, 0, .{ ring, @as(i32, @intCast(tr)), @as(i64, @intCast(start)), @as(i32, @intCast(stride)), @as(i32, @intCast(col)), @as(i32, @intCast(width)), out });
+     }
+     /// out row j = rms(x) * w; kind 0 bf16, 1 fp16; block > 0 skips each block's first row.
+     pub fn rms(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, h: usize, eps: f32, kind: i32, block: usize, rows: usize) !void {
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index 8cff27291..76cc8ec33 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -64,8 +64,8 @@ pub const Options = struct {
+     graphs: bool = false,
+ };
+ 
+-/// Plan ops: stop, decode rows, one stream's prompt chunk, kept states (save, restore, drop, row copy), hello.
+-pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7 };
++/// Plan ops: stop, decode rows, a prompt chunk, kept states (save, restore, drop, row copy), hello, a drafter's calls.
++pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7, taps = 8, draft_open = 9, draft_absorb = 10, draft_hold = 11 };
+ 
+ /// Rank 0's plan word before each call: op, rows, p0, head rows, slot, a, b; rows' ids/positions/slots; streams.
+ pub const Header = extern struct {
+@@ -95,6 +95,7 @@ const Bufs = struct { st: u64, x: u64, seed: u64, y: u64, vin: u64, q: u64, k: u
+ 
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
++    io: std.Io,
+     d: *const cuda.Driver,
+     stream: cuda.Stream,
+     c: config.Config,
+@@ -125,6 +126,9 @@ pub const Model = struct {
+     n_taps: usize = 0,
+     tap_ring: u64 = 0,
+     tapk: ?@import("cuda_draft_load.zig").Kernels = null,
++    // rank 1: the drafter's share, run on rank 0's plan words (cuda_draft.zig's follow)
++    draft_hook: ?*const fn (*Model, *const Header) anyerror!void = null,
++    draft_ptr: ?*anyopaque = null,
+ 
+     /// Loads `dir` (a rank's share at two ranks) on the context's device; sm_121 only.
+     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, d: *const cuda.Driver, dir: []const u8, o: Options) !*Model {
+@@ -143,7 +147,7 @@ pub const Model = struct {
+         defer ck.close();
+         const m = try gpa.create(Model);
+         errdefer gpa.destroy(m);
+-        m.* = .{ .gpa = gpa, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .o = o, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .tree = undefined, .k = undefined, .hq = c.heads / world, .hk = c.kv_heads / world, .ff = c.intermediate / world, .vr = c.vocab / world, .context = o.context, .slots = o.slots };
++        m.* = .{ .gpa = gpa, .io = io, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .o = o, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .tree = undefined, .k = undefined, .hq = c.heads / world, .hk = c.kv_heads / world, .ff = c.intermediate / world, .vr = c.vocab / world, .context = o.context, .slots = o.slots };
+         if (world > 1) {
+             m.group = try cuda.tp_group.Group.open(d, o.place.rank, world);
+             if (o.roce) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
+@@ -238,6 +242,11 @@ pub const Model = struct {
+     pub fn setTaps(m: *Model, taps: []const u32) !void {
+         if (taps.len == 0 or taps.len > m.taps.len or m.tap_ring != 0) return error.RicursiveTaps;
+         for (taps) |t| if (t >= m.c.layers) return error.RicursiveTaps;
++        if (m.rank() == 0 and m.group != null) {
++            var h: Header = .{ .op = @backingInt(Op.taps), .n = @intCast(taps.len) };
++            for (taps, 0..) |t, i| h.ids[i] = @intCast(t);
++            try m.plan(&h);
++        }
+         @memcpy(m.taps[0..taps.len], taps);
+         m.n_taps = taps.len;
+         m.tapk = try @import("cuda_draft_load.zig").Kernels.load(m.d);
+@@ -363,7 +372,7 @@ pub const Model = struct {
+     }
+ 
+     /// Rank 0: the next call's plan word to every rank (rank 1 runs the same call), before it runs.
+-    fn plan(m: *Model, h: *Header) !void {
++    pub fn plan(m: *Model, h: *Header) !void {
+         if (m.group != null) try m.exchange(h);
+     }
+ 
+@@ -400,12 +409,18 @@ pub const Model = struct {
+                 },
+                 .save, .restore, .drop, .copy => try kept.run(m, &h),
+                 .hello => return error.RicursiveRows,
++                .taps => {
++                    var t: [8]u32 = undefined;
++                    for (t[0..@intCast(@min(@max(h.n, 0), 8))], 0..) |*x, i| x.* = @intCast(h.ids[i]);
++                    try m.setTaps(t[0..@intCast(@min(@max(h.n, 0), 8))]);
++                },
++                .draft_open, .draft_absorb, .draft_hold => try (m.draft_hook orelse return error.RicursiveNoDrafter)(m, &h),
+             }
+         }
+     }
+ 
+     /// `bytes` a rank at parts + rank * bytes gathered from every rank, then summed in rank order into `into`.
+-    fn sumRanks(m: *Model, into: u64, bytes: usize) !void {
++    pub fn sumRanks(m: *Model, into: u64, bytes: usize) !void {
+         const g = &m.group.?;
+         try g.allGather(m.stream, m.b.parts + m.rank() * bytes, m.b.parts, bytes);
+         try m.k.rankSum(m.stream, m.b.parts, into, bytes / 4, g.world);
+diff --git a/zig/src/families/ricursive/cuda_lanes.zig b/zig/src/families/ricursive/cuda_lanes.zig
+index 0b1bedc90..164e5abfd 100644
+--- a/zig/src/families/ricursive/cuda_lanes.zig
++++ b/zig/src/families/ricursive/cuda_lanes.zig
+@@ -70,6 +70,7 @@ pub const Ripple = struct {
+     next: u64 = 0,
+     next_id: i32 = 1,
+     priority_copies: bool = false,
++    copies: bool = true, // TF_RICURSIVE_COPY_DRAFTS=0: no prompt-copy drafts (a drafter's own arm)
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *fwd.Model) !Ripple {
+         const v = m.c.vocab;
+@@ -112,7 +113,7 @@ pub const Ripple = struct {
+ 
+     /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
+     pub fn facts(x: *const Ripple) lanes.Model {
+-        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = round_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)) };
++        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = round_rows, .copy_drafts = x.copies, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)) };
+     }
+ 
+     fn self(ptr: *anyopaque) *Ripple {
+diff --git a/zig/src/families/ricursive/cuda_native.zig b/zig/src/families/ricursive/cuda_native.zig
+index 5ee88edf4..10c6f1aae 100644
+--- a/zig/src/families/ricursive/cuda_native.zig
++++ b/zig/src/families/ricursive/cuda_native.zig
+@@ -83,6 +83,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer own.m.deinit();
+     own.r = try rl.Ripple.init(gpa, own.m);
+     own.r.priority_copies = try cuda.priority_copies.read("TF_RICURSIVE_COPIES", o.drafts);
++    own.r.copies = !off("TF_RICURSIVE_COPY_DRAFTS");
+     std.log.info("ricursive: rank 0 of {d}, {d} slot(s) x {d} tokens, {d:.2} GiB of caches a rank, graphs {}, RoCE {}", .{ p.world, slots, o.context, gib(per * slots), own.m.o.graphs, own.m.o.roce });
+     return .{
+         .backend = own.r.backend(),
+@@ -100,7 +101,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []const u8, bits: u8) !struct { drafter: lanes.drafter.Drafter, ctx: *anyopaque, close: *const fn (*anyopaque) void, reserve: *const fn (*anyopaque, u32) anyerror!void } {
+     const own: *Owned = @ptrCast(@alignCast(p));
+     if (bits != 4 and bits != 16) std.log.warn("ricursive: --drafter-bits {d}: the drafter runs its BF16 weights as stored", .{bits});
+-    const d = try Draft.init(gpa, io, own.m, dir, own.dir);
++    const d = try Draft.init(gpa, io, own.m, dir);
+     errdefer d.deinit();
+     try d.time();
+     return .{ .drafter = d.drafter(), .ctx = d, .close = closeDraft, .reserve = reserveDraft };
+diff --git a/zig/tests/ricursive_cuda.zig b/zig/tests/ricursive_cuda.zig
+index 3d72a7d06..a6e00f4cb 100644
+--- a/zig/tests/ricursive_cuda.zig
++++ b/zig/tests/ricursive_cuda.zig
+@@ -50,6 +50,7 @@ pub fn main(init: std.process.Init) !u8 {
+     defer m.deinit();
+     std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB of weights in {d:.1} s; device {d:.2} GiB allocated; context {d}; MemAvailable {d:.1} GiB\n", .{ pl.rank, pl.world, m.c.layers, gib(m.w.bytes), now(io) - t0, gib(cuda.usage(false).device), context, memAvailable(io) });
+     if (pl.rank != 0) {
++        m.draft_hook = rc.draftFollow;
+         try m.follow();
+         std.debug.print("rank {d}: rank 0 stopped; FOLLOW DONE\n", .{pl.rank});
+         return 0;
+-- 
+2.53.0
+

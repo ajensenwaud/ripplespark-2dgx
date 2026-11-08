@@ -1,0 +1,113 @@
+From 3fe6931ef656cb553f411089817b3bbd49cbf8d2 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <5827908+ajensenwaud@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 02:56:15 +1100
+Subject: [PATCH 8/9] ricursive: drafter comments within the lean limit
+
+---
+ zig/kernels/cuda/ricursive_draft.cu       | 14 +++++++-------
+ zig/src/families/ricursive/cuda_draft.zig |  4 ++--
+ zig/src/families/ricursive/cuda_lanes.zig |  2 +-
+ 3 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/zig/kernels/cuda/ricursive_draft.cu b/zig/kernels/cuda/ricursive_draft.cu
+index ecd433e8a..24acfdf3c 100644
+--- a/zig/kernels/cuda/ricursive_draft.cu
++++ b/zig/kernels/cuda/ricursive_draft.cu
+@@ -1,4 +1,4 @@
+-// Ripple's DFlash2 drafter glue (cuda_draft.zig): taps, norms, 4-tap dynamic convolutions, head norms, attention, top-k.
++// Ripple's DFlash2 drafter glue (cuda_draft.zig): taps, norms, 4-tap convolutions, head norms, attention, top-k.
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <stdint.h>
+@@ -63,7 +63,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_ripd_rms(const float* __res
+   }
+ }
+ 
+-// y[t, c] = sum over lags l of (BASE[branch, l, c] + DYN[t, branch * K + l, c / group]) * x[t - l, c], within t's block.
++// y[t, c] = sum over lags l of (BASE[b, l, c] + DYN[t, b * K + l, c / group]) * x[t - l, c], within t's block.
+ template <typename TX, typename TO>
+ __device__ __forceinline__ void conv(const TX* X, const float* DYN, const __nv_bfloat16* BASE, const float* RES, TO* OUT, int D,
+                                      int group, int K, int branch, int block_rows, int rev) {
+@@ -137,7 +137,7 @@ __device__ __forceinline__ void head_norm(const float* x, const __nv_bfloat16* W
+   }
+ }
+ 
+-// Block rows' heads normed (and roped at their stream's position + row) into OUT [rows, heads, 128]. Grid (rows * heads), 32.
++// Block rows' heads normed (roped at the stream's position + row) into OUT [rows, heads, 128]. Grid (rows * heads).
+ extern "C" __global__ void __launch_bounds__(32) tf_ripd_heads(const float* __restrict__ X, int stride, const __nv_bfloat16* __restrict__ W,
+                                                                __nv_bfloat16* __restrict__ OUT, int heads, const Seg* __restrict__ SEGS,
+                                                                int block_rows, float eps, float theta, int rope) {
+@@ -147,7 +147,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_ripd_heads(const float* __re
+   head_norm(X + (size_t)m * stride + head * HD, W, OUT + ((size_t)m * heads + head) * HD, pos, eps, theta, rope);
+ }
+ 
+-// Context rows at pos0 + r: keys normed (and roped) and values into a layer's rings at slot pos % RR. Grid (rows * kv), 32.
++// Context rows at pos0 + r: keys normed (and roped), values, into a layer's rings at pos % RR. Grid (rows * kv).
+ extern "C" __global__ void __launch_bounds__(32) tf_ripd_kv_put(const float* __restrict__ K, const float* __restrict__ V,
+                                                                 const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ RK,
+                                                                 __nv_bfloat16* __restrict__ RV, int kv, long long pos0, int RR, float eps,
+@@ -182,7 +182,7 @@ extern "C" __global__ void tf_ripd_embed(const int* __restrict__ IDS, const __nv
+   for (int i = threadIdx.x; i < H; i += blockDim.x) OUT[(long long)blockIdx.x * H + i] = bf(e[i]);
+ }
+ 
+-// 256 keys of block row m, head h: its stream's ring [first, position), then its block's rows (no mask inside the block).
++// 256 keys of block row m, head h: its stream's ring [first, position), then its block's rows (no mask within).
+ extern "C" __global__ void __launch_bounds__(128) tf_ripd_attn(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KB,
+                                                                const __nv_bfloat16* __restrict__ VB, const Seg* __restrict__ SEGS,
+                                                                int block_rows, int heads, int kv_heads, int RR, int window, int layer,
+@@ -280,7 +280,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_ripd_attn(const __nv_bfloat
+   for (int i = 0; i < DPL; ++i) PO[slot * HD + lane * DPL + i] = out[i];
+ }
+ 
+-// The partials of each (row, head) merged in chunk order into OUT bf16 [rows, heads, 128]. Grid (rows, heads), 32 threads.
++// The partials of each (row, head) merged in chunk order into OUT bf16 [rows, heads, 128]. Grid (rows, heads).
+ extern "C" __global__ void __launch_bounds__(32) tf_ripd_merge(const float* __restrict__ PM, const float* __restrict__ PL,
+                                                                const float* __restrict__ PO, int heads, int chunks,
+                                                                __nv_bfloat16* __restrict__ OUT) {
+@@ -303,7 +303,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_ripd_merge(const float* __re
+   for (int i = 0; i < DPL; ++i) OUT[((size_t)m * heads + h) * HD + lane * DPL + i] = __float2bfloat16_rn(out[i] / sum);
+ }
+ 
+-// A row's slice of logits: its K best (value, id; ties to the lower id) into PV / PI [rows, slices, K]. Grid (slices, rows).
++// A row's slice of logits: its K best (value, id; ties to the lower id) into PV / PI [rows, slices, K].
+ extern "C" __global__ void __launch_bounds__(256) tf_ripd_topk(const float* __restrict__ L, int V, int slice, int K,
+                                                                float* __restrict__ PV, int* __restrict__ PI) {
+   extern __shared__ float sv[];
+diff --git a/zig/src/families/ricursive/cuda_draft.zig b/zig/src/families/ricursive/cuda_draft.zig
+index 4dd5bef36..280f55cd6 100644
+--- a/zig/src/families/ricursive/cuda_draft.zig
++++ b/zig/src/families/ricursive/cuda_draft.zig
+@@ -248,7 +248,7 @@ pub const Draft = struct {
+         }
+     }
+ 
+-    /// Every rank: the plan's blocks through its share; the head's top-k slices gathered on rank 0 (with the selector's).
++    /// Every rank: the plan's blocks through its share; the head's top-k slices gathered (rank 0: the selector too).
+     fn holdRun(d: *Draft, hw: *const fwd.Header, ctxs: []const *Ctx) !void {
+         const c = d.c;
+         const m = d.m;
+@@ -308,7 +308,7 @@ pub const Draft = struct {
+         return @bitCast(@as(u32, v) << 16);
+     }
+ 
+-    /// Rows row0.. of the last hold (`rows` in all): each row's best candidate after the one before (the selector's walk).
++    /// Rows row0.. of the last hold (`rows` in all): each row's best candidate after the one before (the selector).
+     fn chain(d: *const Draft, rows: usize, row0: usize, pending: u32, out: []u32) void {
+         const c = d.c;
+         const sr = ld.slices(d.m.vr) * c.topk; // a rank's candidates a row
+diff --git a/zig/src/families/ricursive/cuda_lanes.zig b/zig/src/families/ricursive/cuda_lanes.zig
+index 164e5abfd..6b618f2fa 100644
+--- a/zig/src/families/ricursive/cuda_lanes.zig
++++ b/zig/src/families/ricursive/cuda_lanes.zig
+@@ -399,7 +399,7 @@ pub const Ripple = struct {
+         return self(ptr).m.setTaps(taps);
+     }
+ 
+-    /// Tap rows [start, start + count) of the stream's slot (a call's rows, read before the next call; its last rows only).
++    /// Tap rows [start, start + count) of the stream's slot (a call's rows, read before the next call; its last only).
+     fn features(ptr: *anyopaque, s: *Stream, taps: []const u32, start: u64, count: u32) anyerror!be.Features {
+         const x = self(ptr);
+         const m = x.m;
+-- 
+2.53.0
+

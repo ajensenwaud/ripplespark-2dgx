@@ -1,0 +1,845 @@
+From 80f7470ccc393bec90b3f427662eb55192a5237e Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <5827908+ajensenwaud@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 19:55:49 +1100
+Subject: [PATCH 3/9] ricursive: TP=2 over two GB10s, full layers to 1M
+ context, decode-row graphs
+
+Rank 0 drives, rank 1 follows: a plan word (op, rows, p0, head rows, ids) is gathered before each call. Each
+layer's o_proj and down_proj fp32 partials are all-gathered (tp_group: NCCL, or RoCE writes with
+TF_RICURSIVE_ROCE=1) and added once in rank order (tf_ripple_rank_sum) before the post-norms; the head's vocab
+halves are gathered. admit(121, 1 | 2); weightShare: the cut share plus the whole bf16 embedding.
+
+Full (NoPE) layers leave window_attention's decode rows (refused above 4,096 keys): decode rows on main's
+tree_attention (512-key groups, merged in order) over a 16-bit (bf16, unquantised) cache of context + 128 rows; prompt
+chunks on window_attention's head dim 128 prompt rows with q padded from 10 to 12 heads a key head
+(tf_ripple_heads). TF_RICURSIVE_FULL_PROMPT=0 keeps prompt chunks on tree rows (prompt == decode bits).
+Decode rows replay as CUDA graphs keyed by 64-group buckets (TF_RICURSIVE_GRAPHS=1, bit-identical to eager).
+tf-ricursive gains follow, long and bench modes.
+---
+ zig/kernels/cuda/ricursive.cu               |  19 +
+ zig/src/families/ricursive/cuda.zig         |  26 +-
+ zig/src/families/ricursive/cuda_forward.zig | 424 +++++++++++++++-----
+ zig/src/families/ricursive/cuda_kernels.zig |  25 +-
+ zig/tests/ricursive_cuda.zig                | 136 ++++++-
+ 5 files changed, 516 insertions(+), 114 deletions(-)
+
+diff --git a/zig/kernels/cuda/ricursive.cu b/zig/kernels/cuda/ricursive.cu
+index 3e2d450a3..541def9d9 100644
+--- a/zig/kernels/cuda/ricursive.cu
++++ b/zig/kernels/cuda/ricursive.cu
+@@ -68,3 +68,22 @@ extern "C" __global__ void __launch_bounds__(256) tf_ripple_norm_add(const float
+   const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(total, (float)width), eps)));
+   for (int i = threadIdx.x; i < width; i += 256) x[i] = __fadd_rn(x[i], __fmul_rn(__fmul_rn(a[i], inv), W[i]));
+ }
++
++// out [n] = parts[0][i] + parts[1][i] + ... in rank order: two ranks' fp32 o_proj or down_proj partials, added once.
++extern "C" __global__ void __launch_bounds__(256) tf_ripple_rank_sum(const float* __restrict__ parts, float* __restrict__ out,
++                                                                     int64_t n, int world) {
++  const int64_t i = (int64_t)blockIdx.x * 256 + threadIdx.x;
++  if (i >= n) return;
++  float v = parts[i];
++  for (int r = 1; r < world; ++r) v = __fadd_rn(v, parts[r * n + i]);
++  out[i] = v;
++}
++
++// dst [groups, gd, 128] bf16 = the first g heads of each src [groups, gs, 128] group (16-byte moves; pads kept).
++extern "C" __global__ void __launch_bounds__(256) tf_ripple_heads(const uint4* __restrict__ src, uint4* __restrict__ dst, int64_t n,
++                                                                  int g, int gs, int gd) {
++  const int64_t i = (int64_t)blockIdx.x * 256 + threadIdx.x;
++  if (i >= n) return;
++  const int64_t c = i % 16, rest = i / 16, j = rest % g, grp = rest / g;
++  dst[(grp * gd + j) * 16 + c] = src[(grp * gs + j) * 16 + c];
++}
+diff --git a/zig/src/families/ricursive/cuda.zig b/zig/src/families/ricursive/cuda.zig
+index b6916575e..bdc399f4a 100644
+--- a/zig/src/families/ricursive/cuda.zig
++++ b/zig/src/families/ricursive/cuda.zig
+@@ -1,10 +1,34 @@
+-//! Ripple (model_type ricursive) on CUDA: an ExLlamaV3 pack on one GB10 (sm_121), main's operators plus ricursive.cu.
++//! Ripple (model_type ricursive) on CUDA: an ExLlamaV3 pack on one or two GB10s (sm_121), main's operators.
++const std = @import("std");
+ pub const config = @import("config.zig");
+ pub const kernels = @import("cuda_kernels.zig");
+ pub const weights = @import("cuda_weights.zig");
+ pub const forward = @import("cuda_forward.zig");
+ pub const Model = forward.Model;
+ 
++/// Bytes this rank's weights take: its share of the cut matrices, plus the bf16 embedding every rank holds whole.
++pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
++    const p = forward.place() catch return total;
++    forward.admit(121, p.world) catch return total;
++    if (p.world == 1) return total;
++    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return total;
++    defer a.free(path);
++    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 22)) catch return total;
++    defer a.free(bytes);
++    const c = config.parse(a, bytes) catch return total;
++    return share(total, @as(u64, c.vocab) * c.hidden * 2, p.world);
++}
++
++fn share(total: u64, whole: u64, world: usize) u64 {
++    if (total < whole) return total;
++    return (total - whole) / world + whole;
++}
++
++test "ricursive weight share: the cut part halves, the embedding stays whole" {
++    try std.testing.expectEqual(@as(u64, 1000), share(1000, 2000, 2));
++    try std.testing.expectEqual(@as(u64, 600), share(1000, 200, 2));
++}
++
+ test {
+     _ = config;
+     _ = kernels;
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index 68e89a111..e5d69aac0 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -1,4 +1,4 @@
+-//! Ripple's forward on one GB10: rows of one stream at positions p0.., prompt chunks or decode rows, logits out.
++//! Ripple's forward on GB10s: rows of one stream at positions p0.., one rank or two (TP=2, rank 0 drives), logits out.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+@@ -7,183 +7,395 @@ const weights = @import("cuda_weights.zig");
+ const Kernels = @import("cuda_kernels.zig").Kernels;
+ 
+ const hd = config.head_dim;
+-/// Rows a forward call runs at once: the EXL3 linears' widest call.
++const Tree = cuda.tree_attention.TreeAttention;
++const max_depth = cuda.tree_attention.max_depth;
++/// Rows a forward call runs at once: the EXL3 linears' widest call, and tree attention's longest path.
+ pub const max_rows = 128;
++/// Rows a tree attention call takes when prompt chunks go to the prompt rows (decode rows only; sizes its scratch).
++const tree_rows = 16;
++/// Query heads a key head in the padded prompt layout (head dim 128 prompt rows take 4 or 8 a block).
++const pad_group = 12;
+ 
+-/// A layer's key and value caches, bf16 [ring, kv heads, 128]: a sliding layer's ring holds its window plus a chunk.
+-const Cache = struct { kc: cuda.DeviceBuffer, vc: cuda.DeviceBuffer, ring: usize };
+-
+-const Scratch = struct {
+-    ids: cuda.DeviceBuffer,
+-    pos: cuda.DeviceBuffer,
+-    x: cuda.DeviceBuffer, // fp32 residual [R, hidden]
+-    seed: cuda.DeviceBuffer, // fp16 scaled embedding [R, hidden]
+-    y: cuda.DeviceBuffer, // fp16 normed [R, hidden]
+-    vin: cuda.DeviceBuffer, // fp16 [R, hidden]
+-    q: cuda.DeviceBuffer, // bf16 [R, q width] (then the attention output)
+-    k: cuda.DeviceBuffer,
+-    v: cuda.DeviceBuffer,
+-    qo: cuda.DeviceBuffer, // bf16 normed, rotated q [R, heads, 128]
+-    ko: cuda.DeviceBuffer,
+-    vo: cuda.DeviceBuffer,
+-    g: cuda.DeviceBuffer, // fp16 [R, q width]
+-    gated: cuda.DeviceBuffer, // fp16 [R, q width]
+-    a: cuda.DeviceBuffer, // fp32 [R, hidden]
+-    gu: cuda.DeviceBuffer, // fp16 [2, R, intermediate]
+-    act: cuda.DeviceBuffer, // fp16 [R, intermediate]
+-    logits: cuda.DeviceBuffer, // fp32 [R, vocab]
+-    attn: cuda.DeviceBuffer,
+-
+-    fn all(s: *Scratch) [19]*cuda.DeviceBuffer {
+-        return .{ &s.ids, &s.pos, &s.x, &s.seed, &s.y, &s.vin, &s.q, &s.k, &s.v, &s.qo, &s.ko, &s.vo, &s.g, &s.gated, &s.a, &s.gu, &s.act, &s.logits, &s.attn };
+-    }
+-};
++/// A layer's K then V cache, bf16 [ring, kv heads, 128]: a sliding ring holds its window plus a chunk.
++const Cache = struct { kv: cuda.DeviceBuffer, ring: usize };
+ 
+-/// What has been validated: sm_121 (GB10) at one rank; every other SM or world is refused by name.
++/// Where a rank stands: TF_RICURSIVE_RANK / TF_RICURSIVE_WORLD (both or neither; neither: one GPU).
++pub const Place = struct { rank: usize = 0, world: usize = 1 };
++
++pub fn place() !Place {
++    const r = std.c.getenv("TF_RICURSIVE_RANK");
++    const w = std.c.getenv("TF_RICURSIVE_WORLD");
++    if (r == null and w == null) return .{};
++    if (r == null or w == null) return error.BadSetting;
++    const p: Place = .{ .rank = std.fmt.parseInt(usize, std.mem.span(r.?), 10) catch return error.BadSetting, .world = std.fmt.parseInt(usize, std.mem.span(w.?), 10) catch return error.BadSetting };
++    if (p.world < 1 or p.rank >= p.world) return error.BadSetting;
++    return p;
++}
++
++/// What has been validated: sm_121 (GB10) at one rank or two; every other SM or world is refused by name.
+ pub fn admit(sm: u32, world: usize) !void {
+     if (sm != 121) return error.RicursiveRequiresSm121;
+-    if (world != 1) return error.RicursiveTpNotValidated;
++    if (world != 1 and world != 2) return error.RicursiveTpNotValidated;
+ }
+ 
+-test "ricursive admission: sm_121 at one rank only" {
++test "ricursive admission: sm_121 at one or two ranks only" {
+     try admit(121, 1);
+-    for ([_]u32{ 80, 86, 89, 90, 100, 120 }) |sm| try std.testing.expectError(error.RicursiveRequiresSm121, admit(sm, 1));
+-    try std.testing.expectError(error.RicursiveTpNotValidated, admit(121, 2));
++    try admit(121, 2);
++    for ([_]u32{ 80, 86, 89, 90, 100, 120 }) |sm| try std.testing.expectError(error.RicursiveRequiresSm121, admit(sm, 2));
++    for ([_]usize{ 0, 3, 4, 8 }) |w| try std.testing.expectError(error.RicursiveTpNotValidated, admit(121, w));
+ }
+ 
++pub const Options = struct {
++    context: usize = 4096,
++    truncated: bool = false,
++    place: Place = .{},
++    /// Full layers' prompt chunks on the window prompt rows (q padded); false: tree rows (prompt == decode bits).
++    full_prompt: bool = true,
++    /// Two ranks' small gathers by RoCE writes (else NCCL carries every gather; the same bits).
++    roce: bool = false,
++    /// Decode rows (one row, its logits) replayed as CUDA graphs keyed by 64-group key buckets.
++    graphs: bool = false,
++};
++
++/// Rank 0's plan word before each call: op (0 stop, 1 decode rows, 2 prompt chunk), rows, p0, head rows, ids.
++const Header = extern struct { op: i32, n: i32, p0: i32, head: i32, ids: [max_rows]i32 };
++
++/// Device scratch: staged ids/pos/stream, activations, gathered partials, tree and prompt-path buffers.
++const Bufs = struct { st: u64, x: u64, seed: u64, y: u64, vin: u64, q: u64, k: u64, v: u64, qo: u64, ko: u64, vo: u64, g: u64, gated: u64, a: u64, parts: u64, gu: u64, act: u64, logits: u64, hdr: u64, paths: u64, depths: u64, zeros: u64, offs: u64, inv: u64, tree: u64, qpad: u64 = 0, opad: u64 = 0 };
++
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+     stream: cuda.Stream,
+     c: config.Config,
++    o: Options,
+     w: weights.Weights,
+     dense: cuda.exl3.Dense,
+     norms: cuda.norms.Norms,
+     qk: cuda.qk_rows.QkRows,
+     attn: cuda.window_attention.WindowAttention,
++    tree: Tree,
+     k: Kernels,
+-    caches: []Cache,
+-    inv: cuda.DeviceBuffer,
+-    sc: Scratch,
++    group: ?cuda.tp_group.Group = null,
++    caches: []Cache = &.{},
++    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    // a rank's heads, key heads, FFN width and vocab share
++    hq: usize,
++    hk: usize,
++    ff: usize,
++    vr: usize,
+     context: usize,
++    b: Bufs = undefined,
++    graphs: std.AutoHashMapUnmanaged(usize, cuda.graph.Exec) = .empty,
++    warm: std.AutoHashMapUnmanaged(usize, void) = .empty,
+ 
+-    /// Loads `dir` on the context's device: sm_121 only, one GPU (TP=2's cuts are weights.Cut, not yet admitted here).
+-    pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, d: *const cuda.Driver, dir: []const u8, context: usize, truncated: bool) !*Model {
+-        try admit(try ctx.capability(), 1);
++    /// Loads `dir` (a rank's share at two ranks) on the context's device; sm_121 only.
++    pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, d: *const cuda.Driver, dir: []const u8, o: Options) !*Model {
++        try admit(try ctx.capability(), o.place.world);
+         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+         defer gpa.free(path);
+         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
+         defer gpa.free(bytes);
+         const c = try config.parse(gpa, bytes);
+-        if (!truncated) _ = try c.qualification(); // a truncation only through the parity tool's --truncated
+-        if (context == 0 or context > 4096) return error.RicursiveContext; // the full layers' decode kernel reads its ring whole
++        if (!o.truncated) _ = try c.qualification(); // a truncation only through the parity tool's --truncated
++        if (o.context == 0 or o.context > std.math.maxInt(i32) - max_rows) return error.RicursiveContext;
++        const world = o.place.world;
++        if (c.heads % world != 0 or c.kv_heads % world != 0) return error.RicursiveCut;
+         var ck = try core.Checkpoint.openModel(gpa, io, dir);
+         defer ck.close();
+         const m = try gpa.create(Model);
+         errdefer gpa.destroy(m);
+-        m.* = .{ .gpa = gpa, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .k = undefined, .caches = &.{}, .inv = undefined, .sc = undefined, .context = context };
+-        m.w = try weights.load(gpa, d, &ck, c, .{});
++        m.* = .{ .gpa = gpa, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .o = o, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .tree = undefined, .k = undefined, .hq = c.heads / world, .hk = c.kv_heads / world, .ff = c.intermediate / world, .vr = c.vocab / world, .context = o.context };
++        if (world > 1) {
++            m.group = try cuda.tp_group.Group.open(d, o.place.rank, world);
++            if (o.roce) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
++        }
++        m.w = try weights.load(gpa, d, &ck, c, .{ .rank = o.place.rank, .world = world });
+         m.dense = try cuda.exl3.Dense.load(d);
+         m.norms = try cuda.norms.Norms.load(d);
+         m.qk = try cuda.qk_rows.QkRows.load(d);
+         m.attn = try cuda.window_attention.WindowAttention.load(d);
++        m.tree = try Tree.load(d);
++        m.tree.sms = @intCast(try ctx.attribute(.multiprocessor_count));
+         m.k = try Kernels.load(d);
++        try m.alloc(c);
++        return m;
++    }
++
++    fn buf(m: *Model, n: usize) !u64 {
++        try m.bufs.ensureUnusedCapacity(m.gpa, 1);
++        const b = try cuda.DeviceBuffer.alloc(m.d, @max(n, 16));
++        m.bufs.appendAssumeCapacity(b);
++        return b.ptr;
++    }
++
++    fn put(m: *Model, bytes: []const u8) !u64 {
++        const p = try m.buf(bytes.len);
++        try m.up(p, bytes);
++        return p;
++    }
++
++    fn up(m: *const Model, p: u64, bytes: []const u8) !void {
++        return (cuda.DeviceBuffer{ .d = m.d, .ptr = p, .len = bytes.len }).upload(0, bytes);
++    }
++
++    fn down(m: *const Model, p: u64, out: []u8) !void {
++        return (cuda.DeviceBuffer{ .d = m.d, .ptr = p, .len = out.len }).download(0, out);
++    }
++
++    fn alloc(m: *Model, c: config.Config) !void {
++        const R = max_rows;
++        const h = c.hidden;
++        const qw = m.hq * hd;
++        const kw = m.hk * hd;
++        const world = m.o.place.world;
++        m.caches = try m.gpa.alloc(Cache, c.layers);
++        for (m.caches) |*ca| ca.* = .{ .kv = .{ .d = m.d, .ptr = 0, .len = 0 }, .ring = 0 };
++        for (m.caches, 0..) |*ca, i| {
++            const ring = if (c.global[i]) m.context + R else c.window + R;
++            ca.* = .{ .kv = try cuda.DeviceBuffer.alloc(m.d, 2 * ring * kw * 2), .ring = ring };
++        }
+         var inv: [hd / 2]f32 = undefined;
+         c.inverseFrequencies(&inv);
+-        m.inv = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(&inv));
+-        m.caches = try gpa.alloc(Cache, c.layers);
+-        const kvb = c.kv_heads * hd * 2;
+-        for (m.caches, 0..) |*ca, i| {
+-            const ring = if (c.global[i]) context else c.window + max_rows;
+-            ca.* = .{ .kc = try cuda.DeviceBuffer.alloc(d, ring * kvb), .vc = try cuda.DeviceBuffer.alloc(d, ring * kvb), .ring = ring };
++        const paths = try m.gpa.alloc(i32, R * max_depth);
++        defer m.gpa.free(paths);
++        var depths: [R]i32 = undefined;
++        for (0..R) |i| {
++            depths[i] = @intCast(i + 1);
++            for (0..max_depth) |j| paths[i * max_depth + j] = @intCast(@min(i, j)); // a chain: row i's path is rows 0..i
++        }
++        const zeros: [R]i32 = @splat(0);
++        const offs = [2]i64{ 0, @intCast((m.context + R) * kw) }; // a full layer's V after its K
++        m.b = .{
++            .st = try m.buf((2 * R + 4) * 4),
++            .x = try m.buf(R * h * 4),
++            .seed = try m.buf(R * h * 2),
++            .y = try m.buf(R * h * 2),
++            .vin = try m.buf(R * h * 2),
++            .q = try m.buf(R * qw * 2),
++            .k = try m.buf(R * kw * 2),
++            .v = try m.buf(R * kw * 2),
++            .qo = try m.buf(R * qw * 2),
++            .ko = try m.buf(R * kw * 2),
++            .vo = try m.buf(R * kw * 2),
++            .g = try m.buf(R * qw * 2),
++            .gated = try m.buf(R * qw * 2),
++            .a = try m.buf(R * h * 4),
++            .parts = try m.buf(world * R * h * 4),
++            .gu = try m.buf(2 * R * m.ff * 2),
++            .act = try m.buf(R * m.ff * 2),
++            .logits = try m.buf(world * R * m.vr * 4),
++            .hdr = try m.buf(world * @sizeOf(Header)),
++            .paths = try m.put(std.mem.sliceAsBytes(paths)),
++            .depths = try m.put(std.mem.sliceAsBytes(&depths)),
++            .zeros = try m.put(std.mem.sliceAsBytes(&zeros)),
++            .offs = try m.put(std.mem.sliceAsBytes(&offs)),
++            .inv = try m.put(std.mem.sliceAsBytes(&inv)),
++            .tree = try m.buf(Tree.scratchBytes(if (m.o.full_prompt) tree_rows else R, m.hq, m.hk, std.mem.alignForward(usize, Tree.groups(m.context + R), 64), hd)),
++        };
++        if (m.o.full_prompt) { // the pad heads stay zero: never written
++            const pb = R * m.hk * pad_group * hd * 2;
++            const z = try m.gpa.alloc(u8, pb);
++            defer m.gpa.free(z);
++            @memset(z, 0);
++            m.b.qpad = try m.put(z);
++            m.b.opad = try m.buf(pb);
+         }
+-        const R = max_rows;
+-        const h = c.hidden;
+-        const qw = c.queryWidth();
+-        const kw = c.kvWidth();
+-        const sizes = [19]usize{ R * 4, R * 4, R * h * 4, R * h * 2, R * h * 2, R * h * 2, R * qw * 2, R * kw * 2, R * kw * 2, R * qw * 2, R * kw * 2, R * kw * 2, R * qw * 2, R * qw * 2, R * h * 4, 2 * R * c.intermediate * 2, R * c.intermediate * 2, R * c.vocab * 4, 256 };
+-        for (m.sc.all(), sizes) |b, n| b.* = try cuda.DeviceBuffer.alloc(d, n);
+-        return m;
+     }
+ 
+     pub fn deinit(m: *Model) void {
+-        for (m.sc.all()) |b| b.free();
+-        for (m.caches) |*ca| {
+-            ca.kc.free();
+-            ca.vc.free();
+-        }
++        var it = m.graphs.valueIterator();
++        while (it.next()) |e| e.deinit();
++        m.graphs.deinit(m.gpa);
++        m.warm.deinit(m.gpa);
++        for (m.bufs.items) |*b| b.free();
++        m.bufs.deinit(m.gpa);
++        for (m.caches) |*ca| if (ca.kv.ptr != 0) ca.kv.free();
+         m.gpa.free(m.caches);
+-        m.inv.free();
+         m.k.unload();
++        m.tree.unload();
+         m.attn.unload();
+         m.qk.unload();
+         m.norms.unload();
+         m.dense.unload();
+         m.w.deinit();
++        if (m.group) |*g| g.close();
+         m.stream.deinit();
+         m.gpa.destroy(m);
+     }
+ 
+-    /// Rows `ids` at p0.. in calls of <= `chunk` rows into fp32 logits `out`; `capture`: each layer's fp32 residual.
++    pub fn rank(m: *const Model) usize {
++        return m.o.place.rank;
++    }
++
++    /// Rows `ids` at p0.. in calls of <= `chunk` rows (> 1: prompt chunks) into fp32 logits `out` (one row: the last).
+     pub fn forward(m: *Model, ids: []const u32, p0: usize, chunk: usize, out: []f32, capture: ?[]f32) !void {
+         if (chunk == 0 or chunk > max_rows or p0 + ids.len > m.context) return error.RicursiveRows;
+-        if (out.len != ids.len * m.c.vocab) return error.RicursiveRows;
++        const last = out.len == m.c.vocab and ids.len > 1;
++        if (!last and out.len != ids.len * m.c.vocab) return error.RicursiveRows;
+         var at: usize = 0;
+         while (at < ids.len) {
+             const n = @min(chunk, ids.len - at);
+-            try m.rows(ids[at..][0..n], p0 + at, out[at * m.c.vocab ..][0 .. n * m.c.vocab], capture, at, ids.len);
++            var h: Header = .{ .op = if (chunk > 1) 2 else 1, .n = @intCast(n), .p0 = @intCast(p0 + at), .head = 0, .ids = @splat(0) };
++            h.head = if (!last) h.n else if (at + n == ids.len) 1 else 0;
++            for (ids[at..][0..n], 0..) |id, i| h.ids[i] = @intCast(id);
++            try m.plan(&h);
++            const o = if (last) out else out[at * m.c.vocab ..][0 .. n * m.c.vocab];
++            try m.rows(&h, if (h.head > 0) o else null, capture, at, ids.len);
+             at += n;
+         }
+     }
+ 
+-    fn rows(m: *Model, ids: []const u32, p0: usize, out: []f32, capture: ?[]f32, at: usize, total: usize) !void {
++    /// Rank 0: the next call's plan word to every rank (rank 1 runs the same call), before it runs.
++    fn plan(m: *Model, h: *const Header) !void {
++        const g = if (m.group) |*g| g else return;
++        try m.stream.synchronize();
++        try m.up(m.b.hdr, std.mem.asBytes(h));
++        try g.allGather(m.stream, m.b.hdr + m.rank() * @sizeOf(Header), m.b.hdr, @sizeOf(Header));
++    }
++
++    /// Rank 0: rank 1's follow loop returns.
++    pub fn stop(m: *Model) !void {
++        if (m.group == null) return;
++        const h: Header = .{ .op = 0, .n = 0, .p0 = 0, .head = 0, .ids = @splat(0) };
++        try m.plan(&h);
++        try m.stream.synchronize();
++    }
++
++    /// Rank 1: rank 0's calls, until its stop.
++    pub fn follow(m: *Model) !void {
++        const g = if (m.group) |*g| g else return error.RicursiveNotFollower;
++        while (true) {
++            try g.allGather(m.stream, m.b.hdr + m.rank() * @sizeOf(Header), m.b.hdr, @sizeOf(Header));
++            try m.stream.synchronize();
++            try g.check();
++            var h: Header = undefined;
++            try m.down(m.b.hdr, std.mem.asBytes(&h));
++            if (h.op == 0) return;
++            if (h.n <= 0 or h.n > max_rows or h.p0 < 0 or h.head < 0 or h.head > h.n or @as(usize, @intCast(h.p0 + h.n)) > m.context) return error.RicursiveRows;
++            try m.rows(&h, null, null, 0, 0);
++        }
++    }
++
++    /// `bytes` a rank at parts + rank * bytes gathered from every rank, then summed in rank order into `into`.
++    fn sumRanks(m: *Model, into: u64, bytes: usize) !void {
++        const g = &m.group.?;
++        try g.allGather(m.stream, m.b.parts + m.rank() * bytes, m.b.parts, bytes);
++        try m.k.rankSum(m.stream, m.b.parts, into, bytes / 4, g.world);
++    }
++
++    fn rows(m: *Model, hw: *const Header, out: ?[]f32, capture: ?[]f32, at: usize, total: usize) !void {
+         const c = m.c;
+         const s = m.stream;
+-        const sc = &m.sc;
+-        const n = ids.len;
+-        const h = c.hidden;
+-        const qw = c.queryWidth();
+-        var host: [max_rows * 2]i32 = undefined;
+-        for (ids, 0..) |id, i| {
+-            host[i] = @intCast(id);
++        const b = &m.b;
++        const n: usize = @intCast(hw.n);
++        const p0: usize = @intCast(hw.p0);
++        const world = m.o.place.world;
++        var host: [2 * max_rows + 4]i32 = @splat(0);
++        for (0..n) |i| {
++            host[i] = hw.ids[i];
+             host[max_rows + i] = @intCast(p0 + i);
+         }
++        host[2 * max_rows ..][0..4].* = .{ 0, @intCast(n), @intCast(p0), 0 }; // tree attention's one stream: rows, committed
++        try s.synchronize();
++        try m.up(b.st, std.mem.sliceAsBytes(&host));
++        const hr: usize = @intCast(hw.head);
++        const one = hw.op == 1 and n == 1 and hr == 1 and capture == null and m.o.graphs;
++        // a graphed decode row keys by its tree groups rounded up to 64 (32K keys): the kernels skip the groups past it
++        const ng = if (one) std.mem.alignForward(usize, Tree.groups(p0 + n), 64) else Tree.groups(p0 + n);
++        if (!one) try m.body(hw, ng, capture, at, total) else if (m.graphs.get(ng)) |e| try e.launchOn(s) else if (m.warm.contains(ng)) {
++            try cuda.graph.beginCapture(s, .thread_local);
++            m.body(hw, ng, null, 0, 0) catch |err| {
++                var g = cuda.graph.endCapture(s) catch return err;
++                g.deinit();
++                return err;
++            };
++            var g = try cuda.graph.endCapture(s);
++            defer g.deinit();
++            const e = try g.instantiate();
++            try m.graphs.put(m.gpa, ng, e);
++            try e.launchOn(s);
++        } else {
++            try m.warm.put(m.gpa, ng, {});
++            try m.body(hw, ng, null, 0, 0); // a bucket's first row eagerly: scratch grows here, never in a capture
++        }
++        if (hr == 0) return;
+         try s.synchronize();
+-        try sc.ids.upload(0, std.mem.sliceAsBytes(host[0..n]));
+-        try sc.pos.upload(0, std.mem.sliceAsBytes(host[max_rows..][0..n]));
+-        try m.k.embed(s, sc.ids.ptr, m.w.embed, sc.x.ptr, sc.seed.ptr, n, h, c.embed_scale);
++        if (m.group) |*g| try g.check();
++        const o = out orelse return;
++        if (world == 1) return m.down(b.logits, std.mem.sliceAsBytes(o));
++        const all = try m.gpa.alloc(f32, world * hr * m.vr);
++        defer m.gpa.free(all);
++        try m.down(b.logits, std.mem.sliceAsBytes(all));
++        for (0..world) |r| for (0..hr) |i| @memcpy(o[i * c.vocab + r * m.vr ..][0..m.vr], all[(r * hr + i) * m.vr ..][0..m.vr]);
++    }
++
++    /// One call's kernels and gathers on the stream (no host work: a decode row captures it as a graph).
++    fn body(m: *Model, hw: *const Header, ng: usize, capture: ?[]f32, at: usize, total: usize) !void {
++        const c = m.c;
++        const s = m.stream;
++        const b = &m.b;
++        const n: usize = @intCast(hw.n);
++        const p0: usize = @intCast(hw.p0);
++        const h = c.hidden;
++        const qw = m.hq * hd;
++        const kw = m.hk * hd;
++        const world = m.o.place.world;
++        const pos = b.st + max_rows * 4;
++        const streams = b.st + 2 * max_rows * 4;
++        try m.k.embed(s, b.st, m.w.embed, b.x, b.seed, n, h, c.embed_scale);
+         for (m.w.layers, m.caches, 0..) |*l, *ca, li| {
+-            try m.norms.rms(s, sc.x.ptr, .f32, l.input_norm, sc.y.ptr, .f16, n, h, c.eps);
+-            try m.dense.prompt(s, l.q, sc.y.ptr, .f16, n, sc.q.ptr, .bf16);
+-            try m.dense.prompt(s, l.k, sc.y.ptr, .f16, n, sc.k.ptr, .bf16);
+-            try m.dense.prompt(s, l.g, sc.y.ptr, .f16, n, sc.g.ptr, .f16);
+-            try m.k.lerp(s, sc.seed.ptr, sc.y.ptr, sc.vin.ptr, n * h, l.blend); // only V sees the value residual
+-            try m.dense.prompt(s, l.v, sc.vin.ptr, .f16, n, sc.v.ptr, .bf16);
+-            const ld: i64 = @intCast(qw);
+-            const kld: i64 = @intCast(c.kvWidth());
+-            const src: cuda.qk_rows.Src = .{ .q = sc.q.ptr, .q_ld = ld, .q_hs = hd, .k = sc.k.ptr, .k_ld = kld, .k_hs = hd, .v = sc.v.ptr, .v_ld = kld, .v_hs = hd };
+-            const shape: cuda.qk_rows.Shape = if (l.global) .{ .norms = l.qk_norm, .eps = c.eps } else .{ .norms = l.qk_norm, .inv = m.inv.ptr, .rot = hd, .eps = c.eps };
+-            try m.qk.rowsFrom(s, src, .{ .h = c.heads, .hk = c.kv_heads, .dim = hd }, shape, sc.pos.ptr, null, .{ .q = sc.qo.ptr, .k = sc.ko.ptr, .v = sc.vo.ptr, .kc = ca.kc.ptr, .vc = ca.vc.ptr, .len = ca.ring }, n);
+-            const win: cuda.window_attention.Window = .{ .h = c.heads, .hk = c.kv_heads, .d = hd, .win = if (l.global) 0 else c.window, .ring = ca.ring, .scale = c.scale() };
+-            try m.attn.decode(s, sc.qo.ptr, ca.kc.ptr, ca.vc.ptr, sc.q.ptr, sc.pos.ptr, null, win, sc.attn.ptr, n);
+-            try m.k.gate(s, sc.q.ptr, sc.g.ptr, sc.gated.ptr, n * qw);
+-            try m.dense.prompt(s, l.o, sc.gated.ptr, .f16, n, sc.a.ptr, .f32);
+-            try m.k.normAdd(s, sc.a.ptr, l.post_attn, sc.x.ptr, n, h, c.eps);
+-            try m.norms.rms(s, sc.x.ptr, .f32, l.pre_ffn, sc.y.ptr, .f16, n, h, c.eps);
+-            const up = sc.gu.ptr + n * c.intermediate * 2;
+-            try m.dense.prompt(s, l.gate, sc.y.ptr, .f16, n, sc.gu.ptr, .f16);
+-            try m.dense.prompt(s, l.up, sc.y.ptr, .f16, n, up, .f16);
+-            try m.k.swiglu(s, sc.gu.ptr, up, sc.act.ptr, n * c.intermediate, c.clamp);
+-            try m.dense.prompt(s, l.down, sc.act.ptr, .f16, n, sc.a.ptr, .f32);
+-            try m.k.normAdd(s, sc.a.ptr, l.post_ffn, sc.x.ptr, n, h, c.eps);
++            const kc = ca.kv.ptr;
++            const vc = ca.kv.ptr + ca.ring * kw * 2;
++            try m.norms.rms(s, b.x, .f32, l.input_norm, b.y, .f16, n, h, c.eps);
++            try m.dense.prompt(s, l.q, b.y, .f16, n, b.q, .bf16);
++            try m.dense.prompt(s, l.k, b.y, .f16, n, b.k, .bf16);
++            try m.dense.prompt(s, l.g, b.y, .f16, n, b.g, .f16);
++            try m.k.lerp(s, b.seed, b.y, b.vin, n * h, l.blend); // only V sees the value residual
++            try m.dense.prompt(s, l.v, b.vin, .f16, n, b.v, .bf16);
++            const src: cuda.qk_rows.Src = .{ .q = b.q, .q_ld = @intCast(qw), .q_hs = hd, .k = b.k, .k_ld = @intCast(kw), .k_hs = hd, .v = b.v, .v_ld = @intCast(kw), .v_hs = hd };
++            const shape: cuda.qk_rows.Shape = if (l.global) .{ .norms = l.qk_norm, .eps = c.eps } else .{ .norms = l.qk_norm, .inv = b.inv, .rot = hd, .eps = c.eps };
++            try m.qk.rowsFrom(s, src, .{ .h = m.hq, .hk = m.hk, .dim = hd }, shape, pos, null, .{ .q = b.qo, .k = b.ko, .v = b.vo, .kc = kc, .vc = vc, .len = ca.ring }, n);
++            if (!l.global) {
++                const win: cuda.window_attention.Window = .{ .h = m.hq, .hk = m.hk, .d = hd, .win = c.window, .ring = ca.ring, .scale = c.scale() };
++                try m.attn.decode(s, b.qo, kc, vc, b.q, pos, null, win, b.tree, n);
++            } else if (hw.op == 2 and m.o.full_prompt) { // prompt rows: q padded to 12 heads a key head, the 10 back
++                const g = m.hq / m.hk;
++                try m.k.heads(s, b.qo, b.qpad, n * m.hk, g, g, pad_group);
++                const win: cuda.window_attention.Window = .{ .h = m.hk * pad_group, .hk = m.hk, .d = hd, .win = 0, .ring = ca.ring, .scale = c.scale() };
++                try m.attn.prompt(s, b.qpad, kc, vc, b.opad, p0, n, win);
++                try m.k.heads(s, b.opad, b.q, n * m.hk, g, pad_group, g);
++            } else { // every key before the row: the cache's p0 keys in 512-key groups, then the chunk's own rows
++                if (m.o.full_prompt and n > tree_rows) return error.RicursiveRows; // decode rows only, scratch for 16
++                const rws: cuda.tree_attention.Rows = .{ .row_stream = b.zeros, .streams = streams, .offs = b.offs, .origin = kc, .paths = b.paths, .depths = b.depths };
++                try m.tree.run(s, b.qo, b.ko, b.vo, rws, Tree.scratch(b.tree, n, m.hq, m.hk, ng, hd), b.q, n, m.hq, m.hk, hd, ng, c.scale());
++            }
++            try m.k.gate(s, b.q, b.g, b.gated, n * qw);
++            if (world == 1) try m.dense.prompt(s, l.o, b.gated, .f16, n, b.a, .f32) else {
++                try m.dense.prompt(s, l.o, b.gated, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++                try m.sumRanks(b.a, n * h * 4);
++            }
++            try m.k.normAdd(s, b.a, l.post_attn, b.x, n, h, c.eps);
++            try m.norms.rms(s, b.x, .f32, l.pre_ffn, b.y, .f16, n, h, c.eps);
++            const gu_up = b.gu + n * m.ff * 2;
++            try m.dense.prompt(s, l.gate, b.y, .f16, n, b.gu, .f16);
++            try m.dense.prompt(s, l.up, b.y, .f16, n, gu_up, .f16);
++            try m.k.swiglu(s, b.gu, gu_up, b.act, n * m.ff, c.clamp);
++            if (world == 1) try m.dense.prompt(s, l.down, b.act, .f16, n, b.a, .f32) else {
++                try m.dense.prompt(s, l.down, b.act, .f16, n, b.parts + m.rank() * n * h * 4, .f32);
++                try m.sumRanks(b.a, n * h * 4);
++            }
++            try m.k.normAdd(s, b.a, l.post_ffn, b.x, n, h, c.eps);
+             if (capture) |cap| {
+                 try s.synchronize();
+-                try sc.x.download(0, std.mem.sliceAsBytes(cap[(li * total + at) * h ..][0 .. n * h]));
++                try m.down(b.x, std.mem.sliceAsBytes(cap[(li * total + at) * h ..][0 .. n * h]));
+             }
+         }
+-        try m.norms.rms(s, sc.x.ptr, .f32, m.w.final_norm, sc.y.ptr, .f16, n, h, c.eps);
+-        try m.dense.prompt(s, m.w.head, sc.y.ptr, .f16, n, sc.logits.ptr, .f32);
+-        try s.synchronize();
+-        try sc.logits.download(0, std.mem.sliceAsBytes(out));
++        const hr: usize = @intCast(hw.head);
++        if (hr == 0) return;
++        try m.norms.rms(s, b.x + (n - hr) * h * 4, .f32, m.w.final_norm, b.y, .f16, hr, h, c.eps);
++        const lg = b.logits + m.rank() * hr * m.vr * 4;
++        try m.dense.prompt(s, m.w.head, b.y, .f16, hr, lg, .f32);
++        if (world > 1) try m.group.?.allGather(s, lg, b.logits, hr * m.vr * 4);
+     }
+ };
+diff --git a/zig/src/families/ricursive/cuda_kernels.zig b/zig/src/families/ricursive/cuda_kernels.zig
+index ae147de6e..d08c3d0d8 100644
+--- a/zig/src/families/ricursive/cuda_kernels.zig
++++ b/zig/src/families/ricursive/cuda_kernels.zig
+@@ -1,4 +1,4 @@
+-//! ricursive.cu's kernels: the embedding scale, the value-residual blend, the gate, the clamped SwiGLU, the post-norms.
++//! ricursive.cu's kernels: embed scale, value residual, gate, clamped SwiGLU, post-norms, rank sums, head moves.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ 
+@@ -13,12 +13,14 @@ pub const Kernels = struct {
+     gate_fn: cuda.Function,
+     swiglu_fn: cuda.Function,
+     norm_add_fn: cuda.Function,
++    rank_sum_fn: cuda.Function,
++    heads_fn: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         var mod = try cuda.Module.load(d, cuda.kernels.ricursive);
+         errdefer mod.unload();
+-        return .{ .mod = mod, .embed_fn = try mod.function("tf_ripple_embed"), .lerp_fn = try mod.function("tf_ripple_lerp"), .gate_fn = try mod.function("tf_ripple_gate"), .swiglu_fn = try mod.function("tf_ripple_swiglu"), .norm_add_fn = try mod.function("tf_ripple_norm_add") };
++        return .{ .mod = mod, .embed_fn = try mod.function("tf_ripple_embed"), .lerp_fn = try mod.function("tf_ripple_lerp"), .gate_fn = try mod.function("tf_ripple_gate"), .swiglu_fn = try mod.function("tf_ripple_swiglu"), .norm_add_fn = try mod.function("tf_ripple_norm_add"), .rank_sum_fn = try mod.function("tf_ripple_rank_sum"), .heads_fn = try mod.function("tf_ripple_heads") };
+     }
+ 
+     pub fn unload(k: *Kernels) void {
+@@ -68,6 +70,25 @@ pub const Kernels = struct {
+         a.add(eps);
+         try cuda.launch.launch(k.norm_add_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+     }
++
++    /// out fp32 [n] = parts[0] + parts[1] + ... in rank order (parts: world runs of n).
++    pub fn rankSum(k: *const Kernels, s: cuda.Stream, parts: u64, out: u64, n: usize, world: usize) !void {
++        var a: cuda.Args = .{};
++        for ([_]u64{ parts, out }) |v| a.add(v);
++        a.add(@as(i64, @intCast(n)));
++        a.add(@as(i32, @intCast(world)));
++        try cuda.launch.launch(k.rank_sum_fn, .{ .grid = .{ .x = blocks(n) }, .block = .{ .x = 256 } }, s, &a);
++    }
++
++    /// The first g heads of each of `groups` key heads' runs: bf16 [groups, gs, 128] -> [groups, gd, 128].
++    pub fn heads(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, groups: usize, g: usize, gs: usize, gd: usize) !void {
++        const n = groups * g * 16; // 16-byte moves
++        var a: cuda.Args = .{};
++        for ([_]u64{ src, dst }) |v| a.add(v);
++        a.add(@as(i64, @intCast(n)));
++        for ([_]usize{ g, gs, gd }) |v| a.add(@as(i32, @intCast(v)));
++        try cuda.launch.launch(k.heads_fn, .{ .grid = .{ .x = blocks(n) }, .block = .{ .x = 256 } }, s, &a);
++    }
+ };
+ 
+ test "ricursive kernels: one 256-thread block per 256 values" {
+diff --git a/zig/tests/ricursive_cuda.zig b/zig/tests/ricursive_cuda.zig
+index 329dadad7..13bc81012 100644
+--- a/zig/tests/ricursive_cuda.zig
++++ b/zig/tests/ricursive_cuda.zig
+@@ -8,20 +8,28 @@ const usage =
+     \\       tf-ricursive <model dir> greedy <ids> <out.txt> <count> [--truncated]
+     \\       tf-ricursive <model dir> layers <ids> <out.f32> [--truncated]
+     \\       tf-ricursive <model dir> suite <run dir> <plain|layers> [--truncated]
++    \\       tf-ricursive <model dir> long <ids> <out prefix> <tail> <stride>
++    \\       tf-ricursive <model dir> bench <ids> <decode rows>
++    \\       tf-ricursive <model dir> follow
+     \\suite: for each "name n" line of <run dir>/texts.txt, name.prompt.f32, name.decode.f32 (first n/2), name.greedy.txt
+     \\(32) and with layers name.layers.f32, from one load.
+     \\<ids>: a file of token ids (comma, space or newline separated). logits: the first <first> ids as prompt chunks of
+     \\128 rows, then every later id as its own decode row; fp32 logits [ids, vocab] (first = ids: all prompt; 0: all
+     \\decode rows). greedy: the ids as a prompt, then <count> argmax tokens one decode row at a time, written as text.
+     \\layers: the prompt path's fp32 residual after each layer [layers, ids, hidden]. --truncated admits a layer prefix
+-    \\of the release (the parity pack), which a serve never does.
++    \\of the release (the parity pack), which a serve never does. long: all but the last <tail> ids as prompt chunks,
++    \\those as decode rows; writes prefix.nll.f32 (-log p of the next id), prefix.top.i32 (argmax) and prefix.rows.f32
++    \\(rows i % stride == stride - 1 and the tail). bench: the ids as a timed prefill (depth marks), then greedy decode.
++    \\TP=2: TF_RICURSIVE_RANK/WORLD and NCCL_COMM_ID; rank 1 follows rank 0 whatever its mode. TF_RICURSIVE_CONTEXT
++    \\(4096), TF_RICURSIVE_FULL_PROMPT=0 (full layers' prompt chunks on tree rows), TF_RICURSIVE_ROCE=1 (RoCE small gathers),
++    \\TF_RICURSIVE_GRAPHS=1 (decode rows as CUDA graphs).
+     \\
+ ;
+ 
+ pub fn main(init: std.process.Init) !u8 {
+     const a = init.arena.allocator();
+     const args = try init.minimal.args.toSlice(a);
+-    if (args.len < 5) {
++    if (args.len < 3) {
+         std.debug.print("{s}", .{usage});
+         return 2;
+     }
+@@ -29,16 +37,24 @@ pub fn main(init: std.process.Init) !u8 {
+     const mode = args[2];
+     const is_suite = std.mem.eql(u8, mode, "suite");
+     var ids: std.ArrayList(u32) = .empty;
+-    if (!is_suite) ids = try readIds(init.io, a, args[3]);
++    const pl = try rc.forward.place();
++    if (!is_suite and pl.rank == 0 and !std.mem.eql(u8, mode, "follow")) ids = try readIds(init.io, a, args[3]);
+     var driver = try cuda.Driver.open();
+     defer driver.close();
+     var ctx = try cuda.Context.init(&driver, 0);
+     defer ctx.deinit();
+     const io = init.io;
+     var t0 = now(io);
+-    const m = try rc.Model.load(init.gpa, init.io, &ctx, &driver, args[1], 4096, truncated);
++    const context = if (std.c.getenv("TF_RICURSIVE_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 4096;
++    const m = try rc.Model.load(init.gpa, init.io, &ctx, &driver, args[1], .{ .context = context, .truncated = truncated, .place = pl, .full_prompt = !off("TF_RICURSIVE_FULL_PROMPT"), .roce = env("TF_RICURSIVE_ROCE"), .graphs = env("TF_RICURSIVE_GRAPHS") });
+     defer m.deinit();
+-    std.debug.print("loaded {d} layers, {d:.2} GiB of weights in {d:.1} s\n", .{ m.c.layers, @as(f64, @floatFromInt(m.w.bytes)) / (1 << 30), now(io) - t0 });
++    std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB of weights in {d:.1} s; device {d:.2} GiB allocated; context {d}; MemAvailable {d:.1} GiB\n", .{ pl.rank, pl.world, m.c.layers, gib(m.w.bytes), now(io) - t0, gib(cuda.usage(false).device), context, memAvailable(io) });
++    if (pl.rank != 0) {
++        try m.follow();
++        std.debug.print("rank {d}: rank 0 stopped; FOLLOW DONE\n", .{pl.rank});
++        return 0;
++    }
++    defer m.stop() catch |err| std.debug.print("stop: {s}\n", .{@errorName(err)});
+     const v = m.c.vocab;
+     const n = ids.items.len;
+     if (std.mem.eql(u8, mode, "logits")) {
+@@ -65,6 +81,10 @@ pub fn main(init: std.process.Init) !u8 {
+         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[4], .data = gen.items });
+     } else if (std.mem.eql(u8, mode, "suite")) {
+         try suite(init, a, m, args[3], std.mem.indexOf(u8, args[4], "layers") != null);
++    } else if (std.mem.eql(u8, mode, "long")) {
++        try long(init, a, m, ids.items, args[4], try std.fmt.parseInt(usize, args[5], 10), try std.fmt.parseInt(usize, args[6], 10));
++    } else if (std.mem.eql(u8, mode, "bench")) {
++        try bench(init, a, m, ids.items, try std.fmt.parseInt(usize, args[4], 10));
+     } else if (std.mem.eql(u8, mode, "layers")) {
+         const out = try a.alloc(f32, n * v);
+         const cap = try a.alloc(f32, m.c.layers * n * m.c.hidden);
+@@ -129,6 +149,112 @@ fn suite(init: std.process.Init, a: std.mem.Allocator, m: *rc.Model, dir: []cons
+     }
+ }
+ 
++fn off(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++fn env(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++fn gib(b: u64) f64 {
++    return @as(f64, @floatFromInt(b)) / (1 << 30);
++}
++
++/// The node's MemAvailable in GiB (the container reads the host's /proc/meminfo), 0 if unreadable.
++fn memAvailable(io: std.Io) f64 {
++    var buf: [4096]u8 = undefined;
++    const text = std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &buf) catch return 0;
++    const at = std.mem.indexOf(u8, text, "MemAvailable:") orelse return 0;
++    var it = std.mem.tokenizeAny(u8, text[at + 13 ..], " \n");
++    const kb = std.fmt.parseInt(u64, it.next() orelse return 0, 10) catch return 0;
++    return @as(f64, @floatFromInt(kb)) / (1 << 20);
++}
++
++/// Per row: -log p(next id), the argmax, and (kept rows) the logits, appended to the three outputs.
++fn score(rows: []const f32, v: usize, first: usize, ids: []const u32, tail: usize, stride: usize, nll: *std.ArrayList(f32), top: *std.ArrayList(i32), kept: *std.ArrayList(f32), a: std.mem.Allocator) !void {
++    const n = rows.len / v;
++    for (0..n) |r| {
++        const i = first + r;
++        const row = rows[r * v ..][0..v];
++        const best = argmax(row);
++        try top.append(a, @intCast(best));
++        if (i + 1 < ids.len) {
++            var s: f64 = 0;
++            for (row) |x| s += @exp(@as(f64, x - row[best]));
++            try nll.append(a, @floatCast(@log(s) + row[best] - row[ids[i + 1]]));
++        }
++        if (i % stride == stride - 1 or i + tail >= ids.len) try kept.appendSlice(a, row);
++    }
++}
++
++/// The long-prompt parity rows: prompt chunks to len - tail, then decode rows (see usage).
++fn long(init: std.process.Init, a: std.mem.Allocator, m: *rc.Model, ids: []const u32, prefix: []const u8, tail: usize, stride: usize) !void {
++    const io = init.io;
++    const v = m.c.vocab;
++    const n = ids.len;
++    const R = rc.forward.max_rows;
++    const out = try a.alloc(f32, R * v);
++    var nll: std.ArrayList(f32) = .empty;
++    var top: std.ArrayList(i32) = .empty;
++    var kept: std.ArrayList(f32) = .empty;
++    const t0 = now(io);
++    var at: usize = 0;
++    while (at < n - tail) : (at += R) {
++        const c = @min(R, n - tail - at);
++        try m.forward(ids[at..][0..c], at, R, out[0 .. c * v], null);
++        try score(out[0 .. c * v], v, at, ids, tail, stride, &nll, &top, &kept, a);
++    }
++    const tp = now(io) - t0;
++    for (n - tail..n) |i| {
++        try m.forward(ids[i..][0..1], i, 1, out[0..v], null);
++        try score(out[0..v], v, i, ids, tail, stride, &nll, &top, &kept, a);
++    }
++    const td = now(io) - t0 - tp;
++    std.debug.print("long: {d} ids, {d} prompt rows in {d:.1} s ({d:.0} tok/s), {d} decode rows {d:.1} ms each; MemAvailable {d:.1} GiB\n", .{ n, n - tail, tp, @as(f64, @floatFromInt(n - tail)) / tp, tail, 1000 * td / @as(f64, @floatFromInt(tail)), memAvailable(io) });
++    for ([_][]const u8{ "nll.f32", "top.i32", "rows.f32" }, [_][]const u8{ std.mem.sliceAsBytes(nll.items), std.mem.sliceAsBytes(top.items), std.mem.sliceAsBytes(kept.items) }) |ext, data|
++        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, ext }), .data = data });
++}
++
++/// Timed prefill of `ids` (128-row prompt chunks, last row's logits only) with depth marks, then greedy decode rows.
++fn bench(init: std.process.Init, a: std.mem.Allocator, m: *rc.Model, ids: []const u32, decode: usize) !void {
++    const io = init.io;
++    const v = m.c.vocab;
++    const n = ids.len;
++    const R = rc.forward.max_rows;
++    const out = try a.alloc(f32, v);
++    const t0 = now(io);
++    var mark: usize = 4096;
++    var since = t0;
++    var since_at: usize = 0;
++    var at: usize = 0;
++    while (at < n) {
++        const c = @min(R, n - at);
++        try m.forward(ids[at..][0..c], at, R, if (c > 1) out else out[0..v], null);
++        at += c;
++        if (at >= mark or at == n) {
++            const t = now(io);
++            std.debug.print("prefill {d}: {d:.1} s, {d:.0} tok/s overall, {d:.0} tok/s over [{d}, {d}); MemAvailable {d:.1} GiB\n", .{ at, t - t0, @as(f64, @floatFromInt(at)) / (t - t0), @as(f64, @floatFromInt(at - since_at)) / (t - since), since_at, at, memAvailable(io) });
++            since = t;
++            since_at = at;
++            while (mark <= at) mark *= 2;
++        }
++    }
++    var tok = argmax(out[0..v]);
++    var gen: std.ArrayList(u8) = .empty;
++    var td: f64 = 0;
++    for (0..decode) |i| {
++        try gen.print(a, "{d} ", .{tok});
++        const t = now(io);
++        try m.forward(&.{tok}, n + i, 1, out[0..v], null);
++        if (i >= 2) td += now(io) - t; // the first two rows warm up
++        tok = argmax(out[0..v]);
++    }
++    if (decode > 2) std.debug.print("decode at {d}: {d} rows, {d:.2} ms a row, {d:.2} tok/s (eager, after 2 warm-up rows); greedy {s}\n", .{ n, decode - 2, 1000 * td / @as(f64, @floatFromInt(decode - 2)), @as(f64, @floatFromInt(decode - 2)) / td, gen.items[0..@min(gen.items.len, 120)] });
++}
++
+ fn now(io: std.Io) f64 {
+     return @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds())) / 1e9;
+ }
+-- 
+2.53.0
+

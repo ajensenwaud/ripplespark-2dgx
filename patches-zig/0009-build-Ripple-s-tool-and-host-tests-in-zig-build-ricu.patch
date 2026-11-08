@@ -1,0 +1,66 @@
+From d7467ef0dab576fb6ce70ff4d47ffa1302ecf016 Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <5827908+ajensenwaud@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 10:15:04 +1100
+Subject: [PATCH 9/9] build: Ripple's tool and host tests in
+ zig/build/ricursive.zig, so zig/build/cuda.zig stays within 600 lines
+
+---
+ zig/build/cuda.zig      |  9 ++-------
+ zig/build/ricursive.zig | 18 ++++++++++++++++++
+ 2 files changed, 20 insertions(+), 7 deletions(-)
+ create mode 100644 zig/build/ricursive.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 24febfbd5..940052913 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -136,10 +136,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const q35_install = b.addInstallArtifact(b.addExecutable(.{ .name = "tf-qwen35-cuda", .root_module = q35 }), .{});
+     b.getInstallStep().dependOn(&q35_install.step);
+     b.step("qwen35-cuda", "Build the Qwen CUDA forward and raw state receipt tool").dependOn(&q35_install.step);
+-    // tf-ricursive: Ripple's CUDA forward rows (prompt and decode) for the exllamav3 parity check
+-    const ricursive = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } });
+-    const rc_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/ricursive_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "ricursive", .module = ricursive } } });
+-    b.step("ricursive-cuda", "Build Ripple's CUDA forward rows tool").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-ricursive", .root_module = rc_tool }), .{}).step);
++    @import("ricursive.zig").tool(b, target, optimize, strip, cuda, mods.core, mods.lanes);
+     // tf-moss-image: MOSS-Image's transformer on a reference case (tools/zig/moss_image_case.py), compared and timed
+     const moss = b.createModule(.{ .root_source_file = b.path("zig/src/families/moss_image/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+     const moss_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/moss_image_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "moss_image", .module = moss } } });
+@@ -250,9 +247,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     }
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_arch_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } }) })).step);
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/moss_image/cuda.zig"), .target = host, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } }) })).step);
+-    const rc_host = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = host, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } }) }));
+-    step.dependOn(&rc_host.step);
+-    b.step("test-ricursive-host", "Ripple's CUDA family on the host: config, admission, TP cuts").dependOn(&rc_host.step);
++    @import("ricursive.zig").hostTests(b, cuda, mods.core, mods.lanes, step);
+     @import("flashnext_glue_host.zig").steps(b, cuda, mods.core, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), step);
+     @import("flashnext_scoring_host.zig").steps(b, cuda, mods.core, mods.lanes, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), step);
+     b.step("test-pocket-device-host", "Actual pocket device hooks under CUDA ABI failures").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), .filters = &.{"Learning persistence:"} })).step);
+diff --git a/zig/build/ricursive.zig b/zig/build/ricursive.zig
+new file mode 100644
+index 000000000..b2f9774b9
+--- /dev/null
++++ b/zig/build/ricursive.zig
+@@ -0,0 +1,18 @@
++//! Ripple's (ricursive) CUDA build steps: the parity/follow tool and the family's host tests.
++const std = @import("std");
++
++fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } });
++}
++
++/// tf-ricursive: Ripple's CUDA forward rows (prompt and decode) for the exllamav3 parity check, and rank 1's follower.
++pub fn tool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
++    const root = b.createModule(.{ .root_source_file = b.path("zig/tests/ricursive_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "ricursive", .module = family(b, target, optimize, cuda, core, lanes) } } });
++    b.step("ricursive-cuda", "Build Ripple's CUDA forward rows tool").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-ricursive", .root_module = root }), .{}).step);
++}
++
++pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, all: *std.Build.Step) void {
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = family(b, b.graph.host, null, cuda, core, lanes) }));
++    all.dependOn(&run.step);
++    b.step("test-ricursive-host", "Ripple's CUDA family on the host: config, admission, TP cuts").dependOn(&run.step);
++}
+-- 
+2.53.0
+

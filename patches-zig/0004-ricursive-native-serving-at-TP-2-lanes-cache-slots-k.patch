@@ -1,0 +1,1363 @@
+From 43d87335bf9943d8723d85734f82c68ba537682c Mon Sep 17 00:00:00 2001
+From: Anders Jensen-Waud <5827908+ajensenwaud@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 23:01:01 +1100
+Subject: [PATCH 4/9] ricursive: native serving at TP=2 (lanes, cache slots,
+ kept prompt states), Ripple's think split
+
+- cuda_forward: cache slots (--parallel streams), decode calls over several streams' rows (tree attention streams,
+  per-row slots), device logits for the lanes' draws, plan ops for kept states, a hello that checks both ranks
+  agree on slots and context; the plan word goes by NCCL, which waits however long rank 0 idles.
+- cuda_lanes: lanes.Backend (prompt chunks cut at the prompt cache's marks, verify windows up to 16 rows, keyed
+  draws), slots chosen by the prompt they already hold.
+- cuda_kept: a kept state is a slot's sliding rings (151 MB a rank); the full layers' rows stay in the slot and are
+  checked against the prompt before a resume (copied to another slot when that one is busy).
+- cuda_native: the native registry entry (1M default context, rank 0 serves, rank 1 runs tf-ricursive follow).
+- server: a template that tests a reply for its own leading <think> (Ripple's) splits reasoning only from a reply
+  that opens one; any other reply is all answer.
+---
+ zig/build/cuda.zig                          |   4 +-
+ zig/build/cuda_engines.zig                  |   1 +
+ zig/src/families/ricursive/cuda.zig         |   3 +
+ zig/src/families/ricursive/cuda_forward.zig | 288 ++++++++++----
+ zig/src/families/ricursive/cuda_kept.zig    |  81 ++++
+ zig/src/families/ricursive/cuda_lanes.zig   | 416 ++++++++++++++++++++
+ zig/src/families/ricursive/cuda_native.zig  | 177 +++++++++
+ zig/src/native/cuda.zig                     |   2 +-
+ zig/src/server/reply_text.zig               |   8 +
+ zig/src/server/reply_think_test.zig         |  23 ++
+ zig/src/server/root.zig                     |   1 +
+ zig/src/server/server.zig                   |   1 +
+ zig/tests/ricursive_cuda.zig                |   2 +-
+ 13 files changed, 933 insertions(+), 74 deletions(-)
+ create mode 100644 zig/src/families/ricursive/cuda_kept.zig
+ create mode 100644 zig/src/families/ricursive/cuda_lanes.zig
+ create mode 100644 zig/src/families/ricursive/cuda_native.zig
+ create mode 100644 zig/src/server/reply_think_test.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index f2609b9e0..24febfbd5 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -137,7 +137,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     b.getInstallStep().dependOn(&q35_install.step);
+     b.step("qwen35-cuda", "Build the Qwen CUDA forward and raw state receipt tool").dependOn(&q35_install.step);
+     // tf-ricursive: Ripple's CUDA forward rows (prompt and decode) for the exllamav3 parity check
+-    const ricursive = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
++    const ricursive = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } });
+     const rc_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/ricursive_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "ricursive", .module = ricursive } } });
+     b.step("ricursive-cuda", "Build Ripple's CUDA forward rows tool").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-ricursive", .root_module = rc_tool }), .{}).step);
+     // tf-moss-image: MOSS-Image's transformer on a reference case (tools/zig/moss_image_case.py), compared and timed
+@@ -250,7 +250,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     }
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_arch_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } }) })).step);
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/moss_image/cuda.zig"), .target = host, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } }) })).step);
+-    const rc_host = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = host, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } }) }));
++    const rc_host = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = host, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } }) }));
+     step.dependOn(&rc_host.step);
+     b.step("test-ricursive-host", "Ripple's CUDA family on the host: config, admission, TP cuts").dependOn(&rc_host.step);
+     @import("flashnext_glue_host.zig").steps(b, cuda, mods.core, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), step);
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index b8886f360..3caabee12 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -56,6 +56,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "spark25", .module = @import("spark25.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "dory", .module = @import("dory.zig").module(b, target, optimize, cuda, core, lanes) },
++            .{ .name = "ricursive_cuda", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/ricursive/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes } } }) },
+         },
+     });
+     mod.addImport("qwen4", @import("qwen4.zig").module(b, target, optimize, core));
+diff --git a/zig/src/families/ricursive/cuda.zig b/zig/src/families/ricursive/cuda.zig
+index bdc399f4a..7da55428e 100644
+--- a/zig/src/families/ricursive/cuda.zig
++++ b/zig/src/families/ricursive/cuda.zig
+@@ -5,6 +5,7 @@ pub const kernels = @import("cuda_kernels.zig");
+ pub const weights = @import("cuda_weights.zig");
+ pub const forward = @import("cuda_forward.zig");
+ pub const Model = forward.Model;
++pub const native = @import("cuda_native.zig");
+ 
+ /// Bytes this rank's weights take: its share of the cut matrices, plus the bf16 embedding every rank holds whole.
+ pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
+@@ -34,4 +35,6 @@ test {
+     _ = kernels;
+     _ = weights;
+     _ = forward;
++    _ = native;
++    _ = @import("cuda_lanes.zig");
+ }
+diff --git a/zig/src/families/ricursive/cuda_forward.zig b/zig/src/families/ricursive/cuda_forward.zig
+index e5d69aac0..165514e0e 100644
+--- a/zig/src/families/ricursive/cuda_forward.zig
++++ b/zig/src/families/ricursive/cuda_forward.zig
+@@ -1,10 +1,11 @@
+-//! Ripple's forward on GB10s: rows of one stream at positions p0.., one rank or two (TP=2, rank 0 drives), logits out.
++//! Ripple's forward on GB10s: rows of one or more streams' cache slots, one rank or two (TP=2, rank 0 drives).
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
+ const config = @import("config.zig");
+ const weights = @import("cuda_weights.zig");
+ const Kernels = @import("cuda_kernels.zig").Kernels;
++const kept = @import("cuda_kept.zig");
+ 
+ const hd = config.head_dim;
+ const Tree = cuda.tree_attention.TreeAttention;
+@@ -12,12 +13,14 @@ const max_depth = cuda.tree_attention.max_depth;
+ /// Rows a forward call runs at once: the EXL3 linears' widest call, and tree attention's longest path.
+ pub const max_rows = 128;
+ /// Rows a tree attention call takes when prompt chunks go to the prompt rows (decode rows only; sizes its scratch).
+-const tree_rows = 16;
++pub const tree_rows = 16;
++/// Streams one decode call holds (each its own slot's rows).
++pub const max_streams = 16;
+ /// Query heads a key head in the padded prompt layout (head dim 128 prompt rows take 4 or 8 a block).
+ const pad_group = 12;
+ 
+-/// A layer's K then V cache, bf16 [ring, kv heads, 128]: a sliding ring holds its window plus a chunk.
+-const Cache = struct { kv: cuda.DeviceBuffer, ring: usize };
++/// A layer's K then V caches, bf16 [slots, ring, kv heads, 128]: a ring is the window (or context) plus a chunk.
++pub const Cache = struct { kv: cuda.DeviceBuffer, ring: usize };
+ 
+ /// Where a rank stands: TF_RICURSIVE_RANK / TF_RICURSIVE_WORLD (both or neither; neither: one GPU).
+ pub const Place = struct { rank: usize = 0, world: usize = 1 };
+@@ -47,6 +50,8 @@ test "ricursive admission: sm_121 at one or two ranks only" {
+ 
+ pub const Options = struct {
+     context: usize = 4096,
++    /// Cache slots (streams); rank 0 tells the followers its slots and context, which must equal theirs.
++    slots: usize = 1,
+     truncated: bool = false,
+     place: Place = .{},
+     /// Full layers' prompt chunks on the window prompt rows (q padded); false: tree rows (prompt == decode bits).
+@@ -57,11 +62,34 @@ pub const Options = struct {
+     graphs: bool = false,
+ };
+ 
+-/// Rank 0's plan word before each call: op (0 stop, 1 decode rows, 2 prompt chunk), rows, p0, head rows, ids.
+-const Header = extern struct { op: i32, n: i32, p0: i32, head: i32, ids: [max_rows]i32 };
++/// Plan ops: stop, decode rows, one stream's prompt chunk, kept states (save, restore, drop, row copy), hello.
++pub const Op = enum(i32) { stop = 0, rows = 1, prompt = 2, save = 3, restore = 4, drop = 5, copy = 6, hello = 7 };
+ 
+-/// Device scratch: staged ids/pos/stream, activations, gathered partials, tree and prompt-path buffers.
+-const Bufs = struct { st: u64, x: u64, seed: u64, y: u64, vin: u64, q: u64, k: u64, v: u64, qo: u64, ko: u64, vo: u64, g: u64, gated: u64, a: u64, parts: u64, gu: u64, act: u64, logits: u64, hdr: u64, paths: u64, depths: u64, zeros: u64, offs: u64, inv: u64, tree: u64, qpad: u64 = 0, opad: u64 = 0 };
++/// Rank 0's plan word before each call: op, rows, p0, head rows, slot, a, b; rows' ids/positions/slots; streams.
++pub const Header = extern struct {
++    op: i32 = 0,
++    n: i32 = 0,
++    p0: i32 = 0,
++    head: i32 = 0,
++    slot: i32 = 0,
++    ns: i32 = 0,
++    a: i32 = 0,
++    b: i32 = 0,
++    ids: [max_rows]i32 = @splat(0),
++    pos: [max_rows]i32 = @splat(0),
++    slots: [max_rows]i32 = @splat(0),
++    streams: [max_streams][4]i32 = @splat(@splat(0)),
++};
++
++/// One stream's rows in a decode call: its slot, its cache length before them, its tokens.
++pub const Entry = struct { slot: usize, p0: usize, tokens: []const u32 };
++
++/// Staged inputs: ids, positions, slots, row streams (int32 [R] each), streams [S, 4], then offs (int64 [S, 2]).
++const stage_i32 = 4 * max_rows + 4 * max_streams;
++const stage_bytes = stage_i32 * 4 + max_streams * 16;
++
++/// Device scratch: staged inputs, activations, gathered partials, tree and prompt-path buffers.
++const Bufs = struct { st: u64, x: u64, seed: u64, y: u64, vin: u64, q: u64, k: u64, v: u64, qo: u64, ko: u64, vo: u64, g: u64, gated: u64, a: u64, parts: u64, gu: u64, act: u64, logits: u64, hdr: u64, paths: u64, depths: u64, inv: u64, tree: u64, qpad: u64 = 0, opad: u64 = 0 };
+ 
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
+@@ -85,9 +113,11 @@ pub const Model = struct {
+     ff: usize,
+     vr: usize,
+     context: usize,
++    slots: usize,
+     b: Bufs = undefined,
+     graphs: std.AutoHashMapUnmanaged(usize, cuda.graph.Exec) = .empty,
+     warm: std.AutoHashMapUnmanaged(usize, void) = .empty,
++    states: kept.States = .{},
+ 
+     /// Loads `dir` (a rank's share at two ranks) on the context's device; sm_121 only.
+     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, d: *const cuda.Driver, dir: []const u8, o: Options) !*Model {
+@@ -99,13 +129,14 @@ pub const Model = struct {
+         const c = try config.parse(gpa, bytes);
+         if (!o.truncated) _ = try c.qualification(); // a truncation only through the parity tool's --truncated
+         if (o.context == 0 or o.context > std.math.maxInt(i32) - max_rows) return error.RicursiveContext;
++        if (o.slots == 0 or o.slots > max_streams) return error.RicursiveSlots;
+         const world = o.place.world;
+         if (c.heads % world != 0 or c.kv_heads % world != 0) return error.RicursiveCut;
+         var ck = try core.Checkpoint.openModel(gpa, io, dir);
+         defer ck.close();
+         const m = try gpa.create(Model);
+         errdefer gpa.destroy(m);
+-        m.* = .{ .gpa = gpa, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .o = o, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .tree = undefined, .k = undefined, .hq = c.heads / world, .hk = c.kv_heads / world, .ff = c.intermediate / world, .vr = c.vocab / world, .context = o.context };
++        m.* = .{ .gpa = gpa, .d = d, .stream = try cuda.Stream.init(d, false), .c = c, .o = o, .w = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .attn = undefined, .tree = undefined, .k = undefined, .hq = c.heads / world, .hk = c.kv_heads / world, .ff = c.intermediate / world, .vr = c.vocab / world, .context = o.context, .slots = o.slots };
+         if (world > 1) {
+             m.group = try cuda.tp_group.Group.open(d, o.place.rank, world);
+             if (o.roce) try m.group.?.openRoce(gpa, io, d, m.stream, max_rows * c.hidden * 4);
+@@ -119,9 +150,17 @@ pub const Model = struct {
+         m.tree.sms = @intCast(try ctx.attribute(.multiprocessor_count));
+         m.k = try Kernels.load(d);
+         try m.alloc(c);
++        if (world > 1) try m.hello();
+         return m;
+     }
+ 
++    /// The device bytes `slots` slots' caches take at `context` (a rank's key heads `hk`).
++    pub fn cacheBytes(c: config.Config, hk: usize, context: usize, slots: usize) u64 {
++        var total: u64 = 0;
++        for (0..c.layers) |i| total += 2 * slots * (if (c.global[i]) context + max_rows else c.window + max_rows) * hk * hd * 2;
++        return total;
++    }
++
+     fn buf(m: *Model, n: usize) !u64 {
+         try m.bufs.ensureUnusedCapacity(m.gpa, 1);
+         const b = try cuda.DeviceBuffer.alloc(m.d, @max(n, 16));
+@@ -129,13 +168,7 @@ pub const Model = struct {
+         return b.ptr;
+     }
+ 
+-    fn put(m: *Model, bytes: []const u8) !u64 {
+-        const p = try m.buf(bytes.len);
+-        try m.up(p, bytes);
+-        return p;
+-    }
+-
+-    fn up(m: *const Model, p: u64, bytes: []const u8) !void {
++    pub fn up(m: *const Model, p: u64, bytes: []const u8) !void {
+         return (cuda.DeviceBuffer{ .d = m.d, .ptr = p, .len = bytes.len }).upload(0, bytes);
+     }
+ 
+@@ -153,21 +186,12 @@ pub const Model = struct {
+         for (m.caches) |*ca| ca.* = .{ .kv = .{ .d = m.d, .ptr = 0, .len = 0 }, .ring = 0 };
+         for (m.caches, 0..) |*ca, i| {
+             const ring = if (c.global[i]) m.context + R else c.window + R;
+-            ca.* = .{ .kv = try cuda.DeviceBuffer.alloc(m.d, 2 * ring * kw * 2), .ring = ring };
++            ca.* = .{ .kv = try cuda.DeviceBuffer.alloc(m.d, 2 * m.slots * ring * kw * 2), .ring = ring };
+         }
+         var inv: [hd / 2]f32 = undefined;
+         c.inverseFrequencies(&inv);
+-        const paths = try m.gpa.alloc(i32, R * max_depth);
+-        defer m.gpa.free(paths);
+-        var depths: [R]i32 = undefined;
+-        for (0..R) |i| {
+-            depths[i] = @intCast(i + 1);
+-            for (0..max_depth) |j| paths[i * max_depth + j] = @intCast(@min(i, j)); // a chain: row i's path is rows 0..i
+-        }
+-        const zeros: [R]i32 = @splat(0);
+-        const offs = [2]i64{ 0, @intCast((m.context + R) * kw) }; // a full layer's V after its K
+         m.b = .{
+-            .st = try m.buf((2 * R + 4) * 4),
++            .st = try m.buf(stage_bytes),
+             .x = try m.buf(R * h * 4),
+             .seed = try m.buf(R * h * 2),
+             .y = try m.buf(R * h * 2),
+@@ -186,24 +210,26 @@ pub const Model = struct {
+             .act = try m.buf(R * m.ff * 2),
+             .logits = try m.buf(world * R * m.vr * 4),
+             .hdr = try m.buf(world * @sizeOf(Header)),
+-            .paths = try m.put(std.mem.sliceAsBytes(paths)),
+-            .depths = try m.put(std.mem.sliceAsBytes(&depths)),
+-            .zeros = try m.put(std.mem.sliceAsBytes(&zeros)),
+-            .offs = try m.put(std.mem.sliceAsBytes(&offs)),
+-            .inv = try m.put(std.mem.sliceAsBytes(&inv)),
++            .paths = try m.buf(R * max_depth * 4),
++            .depths = try m.buf(R * 4),
++            .inv = try m.buf(inv.len * 4),
+             .tree = try m.buf(Tree.scratchBytes(if (m.o.full_prompt) tree_rows else R, m.hq, m.hk, std.mem.alignForward(usize, Tree.groups(m.context + R), 64), hd)),
+         };
++        try m.up(m.b.inv, std.mem.sliceAsBytes(&inv));
+         if (m.o.full_prompt) { // the pad heads stay zero: never written
+             const pb = R * m.hk * pad_group * hd * 2;
+             const z = try m.gpa.alloc(u8, pb);
+             defer m.gpa.free(z);
+             @memset(z, 0);
+-            m.b.qpad = try m.put(z);
++            m.b.qpad = try m.buf(pb);
++            try m.up(m.b.qpad, z);
+             m.b.opad = try m.buf(pb);
+         }
+     }
+ 
+     pub fn deinit(m: *Model) void {
++        m.stream.synchronize() catch {};
++        m.states.deinit(m.gpa);
+         var it = m.graphs.valueIterator();
+         while (it.next()) |e| e.deinit();
+         m.graphs.deinit(m.gpa);
+@@ -228,7 +254,7 @@ pub const Model = struct {
+         return m.o.place.rank;
+     }
+ 
+-    /// Rows `ids` at p0.. in calls of <= `chunk` rows (> 1: prompt chunks) into fp32 logits `out` (one row: the last).
++    /// Slot 0's rows `ids` at p0.. in calls of <= `chunk` rows (> 1: prompt chunks) into host fp32 logits `out`.
+     pub fn forward(m: *Model, ids: []const u32, p0: usize, chunk: usize, out: []f32, capture: ?[]f32) !void {
+         if (chunk == 0 or chunk > max_rows or p0 + ids.len > m.context) return error.RicursiveRows;
+         const last = out.len == m.c.vocab and ids.len > 1;
+@@ -236,9 +262,9 @@ pub const Model = struct {
+         var at: usize = 0;
+         while (at < ids.len) {
+             const n = @min(chunk, ids.len - at);
+-            var h: Header = .{ .op = if (chunk > 1) 2 else 1, .n = @intCast(n), .p0 = @intCast(p0 + at), .head = 0, .ids = @splat(0) };
++            var h: Header = .{ .op = @backingInt(if (chunk > 1) Op.prompt else Op.rows), .n = @intCast(n), .p0 = @intCast(p0 + at) };
+             h.head = if (!last) h.n else if (at + n == ids.len) 1 else 0;
+-            for (ids[at..][0..n], 0..) |id, i| h.ids[i] = @intCast(id);
++            fill(&h, &.{.{ .slot = 0, .p0 = p0 + at, .tokens = ids[at..][0..n] }});
+             try m.plan(&h);
+             const o = if (last) out else out[at * m.c.vocab ..][0 .. n * m.c.vocab];
+             try m.rows(&h, if (h.head > 0) o else null, capture, at, ids.len);
+@@ -246,34 +272,113 @@ pub const Model = struct {
+         }
+     }
+ 
+-    /// Rank 0: the next call's plan word to every rank (rank 1 runs the same call), before it runs.
+-    fn plan(m: *Model, h: *const Header) !void {
++    /// A header's rows and streams from `entries` (each stream's rows in order).
++    fn fill(h: *Header, entries: []const Entry) void {
++        var r: usize = 0;
++        for (entries, 0..) |e, si| {
++            h.streams[si] = .{ @intCast(r), @intCast(e.tokens.len), @intCast(e.p0), @intCast(e.slot) };
++            for (e.tokens, 0..) |t, i| {
++                h.ids[r] = @intCast(t);
++                h.pos[r] = @intCast(e.p0 + i);
++                h.slots[r] = @intCast(e.slot);
++                r += 1;
++            }
++        }
++        h.ns = @intCast(entries.len);
++        h.slot = if (entries.len > 0) @intCast(entries[0].slot) else 0;
++    }
++
++    /// One prompt chunk of `slot` at p0 (device logits of its last row kept when `last`; logitsTo reads them).
++    pub fn prompt(m: *Model, slot: usize, tokens: []const u32, p0: usize, last: bool) !void {
++        if (tokens.len == 0 or tokens.len > max_rows or slot >= m.slots or p0 + tokens.len > m.context) return error.RicursiveRows;
++        var h: Header = .{ .op = @backingInt(Op.prompt), .n = @intCast(tokens.len), .p0 = @intCast(p0), .head = @intFromBool(last) };
++        fill(&h, &.{.{ .slot = slot, .p0 = p0, .tokens = tokens }});
++        try m.plan(&h);
++        try m.rows(&h, null, null, 0, 0);
++    }
++
++    /// Decode rows of several streams in one call (every row's logits; logitsTo reads them).
++    pub fn decode(m: *Model, entries: []const Entry) !void {
++        if (entries.len == 0 or entries.len > max_streams) return error.RicursiveRows;
++        var n: usize = 0;
++        for (entries) |e| {
++            if (e.slot >= m.slots or e.tokens.len == 0 or e.p0 + e.tokens.len > m.context + tree_rows) return error.RicursiveRows;
++            n += e.tokens.len;
++        }
++        if (n > tree_rows) return error.RicursiveRows;
++        var h: Header = .{ .op = @backingInt(Op.rows), .n = @intCast(n), .p0 = @intCast(entries[0].p0), .head = @intCast(n) };
++        fill(&h, entries);
++        try m.plan(&h);
++        try m.rows(&h, null, null, 0, 0);
++    }
++
++    /// The last call's `rows` head rows as fp32 [rows, vocab] at `dst` (device), the ranks' vocab halves interleaved.
++    pub fn logitsTo(m: *Model, dst: u64, rows_: usize) !void {
++        const world = m.o.place.world;
++        for (0..world) |r| {
++            const cp: cuda.abi.Memcpy2D = .{ .src = m.b.logits + r * rows_ * m.vr * 4, .src_pitch = m.vr * 4, .dst = dst + r * m.vr * 4, .dst_pitch = m.c.vocab * 4, .width = m.vr * 4, .height = rows_ };
++            try m.d.check(m.d.api.cuMemcpy2DAsync_v2(&cp, m.stream.handle), "cuMemcpy2DAsync");
++        }
++    }
++
++    /// A kept-state op (save, restore, drop, copy) on every rank.
++    pub fn keptOp(m: *Model, op: Op, slot: usize, a: i32, n: usize) !void {
++        var h: Header = .{ .op = @backingInt(op), .slot = @intCast(slot), .a = a, .p0 = @intCast(n) };
++        try m.plan(&h);
++        try kept.run(m, &h);
++    }
++
++    /// Rank 0's header to every rank (rank 0 uploads it; the others read rank 0's).
++    fn exchange(m: *Model, h: *Header) !void {
+         const g = if (m.group) |*g| g else return;
+         try m.stream.synchronize();
+-        try m.up(m.b.hdr, std.mem.asBytes(h));
+-        try g.allGather(m.stream, m.b.hdr + m.rank() * @sizeOf(Header), m.b.hdr, @sizeOf(Header));
++        if (m.rank() == 0) try m.up(m.b.hdr, std.mem.asBytes(h));
++        // by NCCL, which waits as long as rank 0 idles (RoCE writes give up after their spin limit)
++        try g.lib.check(g.lib.api.ncclAllGather(m.b.hdr + m.rank() * @sizeOf(Header), m.b.hdr, @sizeOf(Header), .u8, g.comm, m.stream.handle), "ncclAllGather");
++        try m.stream.synchronize();
++        try g.check();
++        if (m.rank() != 0) try m.down(m.b.hdr, std.mem.asBytes(h));
++    }
++
++    /// Rank 0: the next call's plan word to every rank (rank 1 runs the same call), before it runs.
++    fn plan(m: *Model, h: *Header) !void {
++        if (m.group != null) try m.exchange(h);
++    }
++
++    /// The ranks agree on context and slots before any call.
++    fn hello(m: *Model) !void {
++        var h: Header = .{ .op = @backingInt(Op.hello), .n = @intCast(m.slots), .p0 = @intCast(m.context) };
++        try m.exchange(&h);
++        if (h.op != @backingInt(Op.hello) or h.n != m.slots or h.p0 != m.context) {
++            std.log.err("ricursive rank {d}: rank 0 serves {d} slots at {d}, this rank {d} at {d} (TF_RICURSIVE_SLOTS, TF_RICURSIVE_CONTEXT)", .{ m.rank(), h.n, h.p0, m.slots, m.context });
++            return error.RicursiveRanksDisagree;
++        }
+     }
+ 
+     /// Rank 0: rank 1's follow loop returns.
+     pub fn stop(m: *Model) !void {
+         if (m.group == null) return;
+-        const h: Header = .{ .op = 0, .n = 0, .p0 = 0, .head = 0, .ids = @splat(0) };
++        var h: Header = .{};
+         try m.plan(&h);
+         try m.stream.synchronize();
+     }
+ 
+     /// Rank 1: rank 0's calls, until its stop.
+     pub fn follow(m: *Model) !void {
+-        const g = if (m.group) |*g| g else return error.RicursiveNotFollower;
++        if (m.group == null) return error.RicursiveNotFollower;
+         while (true) {
+-            try g.allGather(m.stream, m.b.hdr + m.rank() * @sizeOf(Header), m.b.hdr, @sizeOf(Header));
+-            try m.stream.synchronize();
+-            try g.check();
+-            var h: Header = undefined;
+-            try m.down(m.b.hdr, std.mem.asBytes(&h));
+-            if (h.op == 0) return;
+-            if (h.n <= 0 or h.n > max_rows or h.p0 < 0 or h.head < 0 or h.head > h.n or @as(usize, @intCast(h.p0 + h.n)) > m.context) return error.RicursiveRows;
+-            try m.rows(&h, null, null, 0, 0);
++            var h: Header = .{};
++            try m.exchange(&h);
++            const op = std.enums.fromInt(Op, h.op) orelse return error.RicursiveRows;
++            switch (op) {
++                .stop => return,
++                .rows, .prompt => {
++                    if (h.n <= 0 or h.n > max_rows or h.p0 < 0 or h.head < 0 or h.head > h.n or h.ns <= 0 or h.ns > max_streams) return error.RicursiveRows;
++                    try m.rows(&h, null, null, 0, 0);
++                },
++                .save, .restore, .drop, .copy => try kept.run(m, &h),
++                .hello => return error.RicursiveRows,
++            }
+         }
+     }
+ 
+@@ -284,25 +389,63 @@ pub const Model = struct {
+         try m.k.rankSum(m.stream, m.b.parts, into, bytes / 4, g.world);
+     }
+ 
++    /// Stages a call's inputs: ids, positions, slots, the streams' tree entries and key offsets, their chain paths.
++    fn stage(m: *Model, hw: *const Header) !usize {
++        const n: usize = @intCast(hw.n);
++        const ns: usize = @intCast(hw.ns);
++        var host: [stage_i32]i32 = @splat(0);
++        @memcpy(host[0..max_rows], &hw.ids);
++        @memcpy(host[max_rows..][0..max_rows], &hw.pos);
++        @memcpy(host[2 * max_rows ..][0..max_rows], &hw.slots);
++        var top: usize = 0; // the furthest key a row reads: the tree groups to walk
++        var offs: [max_streams][2]i64 = @splat(.{ 0, 0 });
++        var paths: [tree_rows * max_depth]i32 = @splat(0);
++        var depths: [max_rows]i32 = @splat(0);
++        const kw = m.hk * hd;
++        for (0..ns) |si| {
++            const e = hw.streams[si];
++            host[4 * max_rows + 4 * si ..][0..4].* = .{ e[0], e[1], e[2], 0 };
++            top = @max(top, @as(usize, @intCast(e[2] + e[1])));
++            const slot: usize = @intCast(e[3]);
++            const ring = m.context + max_rows; // a full layer's ring: its slot's K, then V after every slot's K
++            offs[si] = .{ @intCast(slot * ring * kw), @intCast((m.slots + slot) * ring * kw) };
++            const r0: usize = @intCast(e[0]);
++            for (0..@intCast(e[1])) |i| {
++                host[3 * max_rows + r0 + i] = @intCast(si);
++                depths[r0 + i] = @intCast(i + 1);
++                if (r0 + i < tree_rows) for (0..max_depth) |j| { // a chain: row i's path is its stream's rows 0..i
++                    paths[(r0 + i) * max_depth + j] = @intCast(r0 + @min(i, j));
++                };
++            }
++        }
++        try m.stream.synchronize();
++        try m.up(m.b.st, std.mem.sliceAsBytes(&host));
++        try m.up(m.b.st + stage_i32 * 4, std.mem.sliceAsBytes(offs[0..ns]));
++        const pr: usize = @min(n, tree_rows);
++        try m.up(m.b.paths, std.mem.sliceAsBytes(paths[0 .. pr * max_depth]));
++        if (n > tree_rows) { // a prompt chunk on tree rows (one stream from row 0): its longer chain
++            const big = try m.gpa.alloc(i32, n * max_depth);
++            defer m.gpa.free(big);
++            for (0..n) |i| for (0..max_depth) |j| {
++                big[i * max_depth + j] = @intCast(@min(i, j));
++            };
++            try m.up(m.b.paths, std.mem.sliceAsBytes(big));
++        }
++        try m.up(m.b.depths, std.mem.sliceAsBytes(depths[0..n]));
++        return top;
++    }
++
+     fn rows(m: *Model, hw: *const Header, out: ?[]f32, capture: ?[]f32, at: usize, total: usize) !void {
+         const c = m.c;
+         const s = m.stream;
+         const b = &m.b;
+         const n: usize = @intCast(hw.n);
+-        const p0: usize = @intCast(hw.p0);
+         const world = m.o.place.world;
+-        var host: [2 * max_rows + 4]i32 = @splat(0);
+-        for (0..n) |i| {
+-            host[i] = hw.ids[i];
+-            host[max_rows + i] = @intCast(p0 + i);
+-        }
+-        host[2 * max_rows ..][0..4].* = .{ 0, @intCast(n), @intCast(p0), 0 }; // tree attention's one stream: rows, committed
+-        try s.synchronize();
+-        try m.up(b.st, std.mem.sliceAsBytes(&host));
++        const top = try m.stage(hw);
+         const hr: usize = @intCast(hw.head);
+-        const one = hw.op == 1 and n == 1 and hr == 1 and capture == null and m.o.graphs;
++        const one = hw.op == @backingInt(Op.rows) and n == 1 and hr == 1 and capture == null and m.o.graphs;
+         // a graphed decode row keys by its tree groups rounded up to 64 (32K keys): the kernels skip the groups past it
+-        const ng = if (one) std.mem.alignForward(usize, Tree.groups(p0 + n), 64) else Tree.groups(p0 + n);
++        const ng = if (one) std.mem.alignForward(usize, Tree.groups(top), 64) else Tree.groups(top);
+         if (!one) try m.body(hw, ng, capture, at, total) else if (m.graphs.get(ng)) |e| try e.launchOn(s) else if (m.warm.contains(ng)) {
+             try cuda.graph.beginCapture(s, .thread_local);
+             m.body(hw, ng, null, 0, 0) catch |err| {
+@@ -320,9 +463,9 @@ pub const Model = struct {
+             try m.body(hw, ng, null, 0, 0); // a bucket's first row eagerly: scratch grows here, never in a capture
+         }
+         if (hr == 0) return;
++        const o = out orelse return;
+         try s.synchronize();
+         if (m.group) |*g| try g.check();
+-        const o = out orelse return;
+         if (world == 1) return m.down(b.logits, std.mem.sliceAsBytes(o));
+         const all = try m.gpa.alloc(f32, world * hr * m.vr);
+         defer m.gpa.free(all);
+@@ -342,11 +485,15 @@ pub const Model = struct {
+         const kw = m.hk * hd;
+         const world = m.o.place.world;
+         const pos = b.st + max_rows * 4;
+-        const streams = b.st + 2 * max_rows * 4;
++        const slots = b.st + 2 * max_rows * 4;
++        const row_stream = b.st + 3 * max_rows * 4;
++        const streams = b.st + 4 * max_rows * 4;
++        const offs = b.st + stage_i32 * 4;
++        const slot: usize = @intCast(hw.slot);
+         try m.k.embed(s, b.st, m.w.embed, b.x, b.seed, n, h, c.embed_scale);
+         for (m.w.layers, m.caches, 0..) |*l, *ca, li| {
+             const kc = ca.kv.ptr;
+-            const vc = ca.kv.ptr + ca.ring * kw * 2;
++            const vc = ca.kv.ptr + m.slots * ca.ring * kw * 2;
+             try m.norms.rms(s, b.x, .f32, l.input_norm, b.y, .f16, n, h, c.eps);
+             try m.dense.prompt(s, l.q, b.y, .f16, n, b.q, .bf16);
+             try m.dense.prompt(s, l.k, b.y, .f16, n, b.k, .bf16);
+@@ -355,19 +502,20 @@ pub const Model = struct {
+             try m.dense.prompt(s, l.v, b.vin, .f16, n, b.v, .bf16);
+             const src: cuda.qk_rows.Src = .{ .q = b.q, .q_ld = @intCast(qw), .q_hs = hd, .k = b.k, .k_ld = @intCast(kw), .k_hs = hd, .v = b.v, .v_ld = @intCast(kw), .v_hs = hd };
+             const shape: cuda.qk_rows.Shape = if (l.global) .{ .norms = l.qk_norm, .eps = c.eps } else .{ .norms = l.qk_norm, .inv = b.inv, .rot = hd, .eps = c.eps };
+-            try m.qk.rowsFrom(s, src, .{ .h = m.hq, .hk = m.hk, .dim = hd }, shape, pos, null, .{ .q = b.qo, .k = b.ko, .v = b.vo, .kc = kc, .vc = vc, .len = ca.ring }, n);
++            try m.qk.rowsFrom(s, src, .{ .h = m.hq, .hk = m.hk, .dim = hd }, shape, pos, slots, .{ .q = b.qo, .k = b.ko, .v = b.vo, .kc = kc, .vc = vc, .len = ca.ring }, n);
+             if (!l.global) {
+                 const win: cuda.window_attention.Window = .{ .h = m.hq, .hk = m.hk, .d = hd, .win = c.window, .ring = ca.ring, .scale = c.scale() };
+-                try m.attn.decode(s, b.qo, kc, vc, b.q, pos, null, win, b.tree, n);
+-            } else if (hw.op == 2 and m.o.full_prompt) { // prompt rows: q padded to 12 heads a key head, the 10 back
++                try m.attn.decode(s, b.qo, kc, vc, b.q, pos, slots, win, b.tree, n);
++            } else if (hw.op == @backingInt(Op.prompt) and m.o.full_prompt) { // prompt rows: q padded to 12 heads a key head
+                 const g = m.hq / m.hk;
++                const so = slot * ca.ring * kw * 2;
+                 try m.k.heads(s, b.qo, b.qpad, n * m.hk, g, g, pad_group);
+                 const win: cuda.window_attention.Window = .{ .h = m.hk * pad_group, .hk = m.hk, .d = hd, .win = 0, .ring = ca.ring, .scale = c.scale() };
+-                try m.attn.prompt(s, b.qpad, kc, vc, b.opad, p0, n, win);
++                try m.attn.prompt(s, b.qpad, kc + so, vc + so, b.opad, p0, n, win);
+                 try m.k.heads(s, b.opad, b.q, n * m.hk, g, pad_group, g);
+-            } else { // every key before the row: the cache's p0 keys in 512-key groups, then the chunk's own rows
++            } else { // every key before the row: the cache's committed keys in 512-key groups, then the call's own rows
+                 if (m.o.full_prompt and n > tree_rows) return error.RicursiveRows; // decode rows only, scratch for 16
+-                const rws: cuda.tree_attention.Rows = .{ .row_stream = b.zeros, .streams = streams, .offs = b.offs, .origin = kc, .paths = b.paths, .depths = b.depths };
++                const rws: cuda.tree_attention.Rows = .{ .row_stream = row_stream, .streams = streams, .offs = offs, .origin = kc, .paths = b.paths, .depths = b.depths };
+                 try m.tree.run(s, b.qo, b.ko, b.vo, rws, Tree.scratch(b.tree, n, m.hq, m.hk, ng, hd), b.q, n, m.hq, m.hk, hd, ng, c.scale());
+             }
+             try m.k.gate(s, b.q, b.g, b.gated, n * qw);
+diff --git a/zig/src/families/ricursive/cuda_kept.zig b/zig/src/families/ricursive/cuda_kept.zig
+new file mode 100644
+index 000000000..e4da3347f
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_kept.zig
+@@ -0,0 +1,81 @@
++//! Kept prompt states on every rank: a state is its slot's sliding rings; the full layers' rows stay in the slot.
++const std = @import("std");
++const cuda = @import("cuda");
++const fwd = @import("cuda_forward.zig");
++
++const hd = @import("config.zig").head_dim;
++
++/// A rank's copies by the id rank 0 gave them (no policy here: rank 0's lanes decide).
++pub const States = struct {
++    by_id: std.AutoHashMapUnmanaged(i32, cuda.DeviceBuffer) = .empty,
++
++    pub fn deinit(st: *States, gpa: std.mem.Allocator) void {
++        var it = st.by_id.valueIterator();
++        while (it.next()) |b| b.free();
++        st.by_id.deinit(gpa);
++    }
++};
++
++/// Bytes a state takes on a rank: every sliding layer's K and V ring of one slot.
++pub fn bytes(m: *const fwd.Model) u64 {
++    var total: u64 = 0;
++    for (m.caches, 0..) |ca, i| if (!m.c.global[i]) {
++        total += 2 * ca.ring * m.hk * hd * 2;
++    };
++    return total;
++}
++
++fn copy(m: *fwd.Model, dst: u64, src: u64, n: usize) !void {
++    try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, m.stream.handle), "cuMemcpyDtoDAsync");
++}
++
++/// K's then V's region of `slot` in a layer's cache, `n` bytes from row 0.
++fn region(m: *const fwd.Model, ca: fwd.Cache, slot: usize, v: bool) u64 {
++    const kw = m.hk * hd;
++    return ca.kv.ptr + (@as(u64, @intFromBool(v)) * m.slots + slot) * ca.ring * kw * 2;
++}
++
++/// A kept-state header: save (slot's rings as state a), restore (a into slot), drop (a), copy (rows [0, p0) of a).
++pub fn run(m: *fwd.Model, h: *const fwd.Header) !void {
++    const op: fwd.Op = @fromBackingInt(@intCast(h.op));
++    const slot: usize = @intCast(h.slot);
++    const kw = m.hk * hd;
++    if (op != .drop and slot >= m.slots) return error.RicursiveSlots;
++    switch (op) {
++        .save => {
++            if (m.states.by_id.contains(h.a)) return error.RicursiveStateId;
++            var b = try cuda.DeviceBuffer.alloc(m.d, bytes(m));
++            errdefer b.free();
++            var at: u64 = 0;
++            for (m.caches, 0..) |ca, i| if (!m.c.global[i]) for ([_]bool{ false, true }) |v| {
++                const n = ca.ring * kw * 2;
++                try copy(m, b.ptr + at, region(m, ca, slot, v), n);
++                at += n;
++            };
++            try m.states.by_id.put(m.gpa, h.a, b);
++        },
++        .restore => {
++            const b = m.states.by_id.get(h.a) orelse return error.RicursiveStateId;
++            var at: u64 = 0;
++            for (m.caches, 0..) |ca, i| if (!m.c.global[i]) for ([_]bool{ false, true }) |v| {
++                const n = ca.ring * kw * 2;
++                try copy(m, region(m, ca, slot, v), b.ptr + at, n);
++                at += n;
++            };
++        },
++        .drop => {
++            var e = m.states.by_id.fetchRemove(h.a) orelse return;
++            try m.stream.synchronize(); // a restore's queued copies out of it are done
++            e.value.free();
++        },
++        .copy => {
++            const from: usize = @intCast(h.a);
++            const rows: usize = @intCast(h.p0);
++            if (from >= m.slots or rows > m.context) return error.RicursiveSlots;
++            for (m.caches, 0..) |ca, i| if (m.c.global[i]) for ([_]bool{ false, true }) |v| {
++                try copy(m, region(m, ca, slot, v), region(m, ca, from, v), rows * kw * 2);
++            };
++        },
++        else => return error.RicursiveRows,
++    }
++}
+diff --git a/zig/src/families/ricursive/cuda_lanes.zig b/zig/src/families/ricursive/cuda_lanes.zig
+new file mode 100644
+index 000000000..dbab966c3
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_lanes.zig
+@@ -0,0 +1,416 @@
++//! Ripple behind lanes.Backend: a cache slot a stream, prompts a chunk a step, one forward a round of windows.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const fwd = @import("cuda_forward.zig");
++const kept = @import("cuda_kept.zig");
++
++const be = lanes.backend;
++const Stream = lanes.Stream;
++
++/// Prompt rows a step takes: the forward's chunk, cut at the prompt cache's marks.
++pub const prompt_rows: u32 = fwd.max_rows;
++/// Rows a round takes over every stream (tree attention's decode scratch), and the widest window a stream verifies.
++pub const round_rows: u32 = fwd.tree_rows;
++/// Drawn tokens a handle names (a ring; read before the round loop could wrap it).
++const ring = 1024;
++
++const Lane = struct {
++    slot: usize,
++    len: u64 = 0, // the cache length: positions [0, len) hold this stream's keys
++    base: u64 = 0, // the cache length the last verify started from
++    rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
++    last: u64, // the prompt's last row's fp32 logits [V] (the first draw reads them)
++    rule: u64, // sample.cu's Rule, when the stream samples
++    sampled: bool = false,
++    fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
++};
++
++/// A kept state: its id on every rank, its position and the slot whose full rows it leaves in place.
++pub const Saved = struct { id: i32, at: u32, slot: usize };
++
++/// The torch-op images' functions the draws need (argmax by torch's first-maximum rule, bf16 casts) and sample.cu.
++const Draw = struct {
++    mods: [3]cuda.Module,
++    argmax_fn: cuda.Function,
++    to_bf16_fn: cuda.Function,
++    draws: cuda.sample.Draws,
++
++    fn load(d: *const cuda.Driver) !Draw {
++        const kk = cuda.kernels;
++        if (!kk.available) return error.BuiltWithoutKernels;
++        var k: Draw = undefined;
++        var made: usize = 0;
++        errdefer for (k.mods[0..made]) |*m| m.unload();
++        for ([_][]const u8{ kk.sample, kk.torch_argmax, kk.torch_pointwise }, 0..) |img, i| {
++            k.mods[i] = try cuda.Module.load(d, img);
++            made += 1;
++        }
++        k.draws = try cuda.sample.Draws.resolve(k.mods[0]);
++        k.argmax_fn = try k.mods[1].function("tf_argmax_rows_i32_kernel");
++        k.to_bf16_fn = try k.mods[2].function("tf_f32_to_bf16_kernel");
++        return k;
++    }
++};
++
++pub const Ripple = struct {
++    gpa: std.mem.Allocator,
++    m: *fwd.Model,
++    k: Draw,
++    lanes: std.AutoHashMapUnmanaged(*const Stream, Lane) = .empty,
++    free: []bool, // slot i is free
++    written: []std.ArrayList(u32), // the tokens a slot's full rows hold at positions 0.. (kept states resume on them)
++    used: []u64, // when a slot was last taken (the least recent of equals goes first)
++    clock: u64 = 0,
++    logits: cuda.DeviceBuffer, // fp32 [round_rows, V]
++    logits16: cuda.DeviceBuffer, // their bf16 copy for keyed draws
++    tok: cuda.DeviceBuffer, // drawn tokens: the handle ring, then a round's rows
++    meta: cuda.DeviceBuffer, // a draw's first position minus one, a window each
++    slot_bufs: []cuda.DeviceBuffer, // a slot's last-row logits, then its rule: two a slot
++    next: u64 = 0,
++    next_id: i32 = 1,
++    priority_copies: bool = false,
++
++    pub fn init(gpa: std.mem.Allocator, m: *fwd.Model) !Ripple {
++        const v = m.c.vocab;
++        const d = m.d;
++        var k = try Draw.load(d);
++        errdefer for (&k.mods) |*x| x.unload();
++        const free = try gpa.alloc(bool, m.slots);
++        @memset(free, true);
++        const written = try gpa.alloc(std.ArrayList(u32), m.slots);
++        @memset(written, .empty);
++        const used = try gpa.alloc(u64, m.slots);
++        @memset(used, 0);
++        const bufs = try gpa.alloc(cuda.DeviceBuffer, 2 * m.slots);
++        for (bufs, 0..) |*b, i| b.* = try cuda.DeviceBuffer.alloc(d, if (i % 2 == 0) v * 4 else @sizeOf(cuda.sample.Rule));
++        return .{ .gpa = gpa, .m = m, .k = k, .free = free, .written = written, .used = used, .logits = try cuda.DeviceBuffer.alloc(d, round_rows * v * 4), .logits16 = try cuda.DeviceBuffer.alloc(d, round_rows * v * 2), .tok = try cuda.DeviceBuffer.alloc(d, (ring + round_rows) * 4), .meta = try cuda.DeviceBuffer.alloc(d, round_rows * 16), .slot_bufs = bufs };
++    }
++
++    pub fn deinit(x: *Ripple) void {
++        var it = x.lanes.valueIterator();
++        while (it.next()) |l| l.rows.deinit(x.gpa);
++        x.lanes.deinit(x.gpa);
++        for (x.slot_bufs) |*b| b.free();
++        x.gpa.free(x.slot_bufs);
++        for (x.written) |*w| w.deinit(x.gpa);
++        x.gpa.free(x.written);
++        x.gpa.free(x.used);
++        x.gpa.free(x.free);
++        x.logits.free();
++        x.logits16.free();
++        x.tok.free();
++        x.meta.free();
++        for (&x.k.mods) |*md| md.unload();
++    }
++
++    pub fn backend(x: *Ripple) be.Backend {
++        return .{ .ptr = x, .vtable = &vtable, .chunk_invariant = false };
++    }
++
++    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .cancel_prefill = cancelPrefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true };
++
++    /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
++    pub fn facts(x: *const Ripple) lanes.Model {
++        return .{ .root_copies = x.priority_copies, .context_copies = x.priority_copies, .copy_match = if (x.priority_copies) 4 else 8, .exact_width = round_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)) };
++    }
++
++    fn self(ptr: *anyopaque) *Ripple {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn launch(x: *Ripple, f: cuda.Function, grid: u32, block: u32, a: *cuda.Args) !void {
++        try cuda.launch.launch(f, .{ .grid = .{ .x = grid }, .block = .{ .x = block } }, x.m.stream, a);
++    }
++
++    /// Rows [row0, row0 + rows) of `logits` drawn into tok[at..], row r at `position0 + r` (argmax when greedy).
++    fn drawRows(x: *Ripple, l: *const Lane, logits: u64, row0: usize, rows: usize, position0: u64, at: usize, meta_at: usize) !void {
++        const v = x.m.c.vocab;
++        const src = logits + row0 * v * 4;
++        var a: cuda.Args = .{};
++        if (!l.sampled) {
++            a.add(src);
++            a.add(x.tok.ptr + at * 4);
++            for ([_]usize{ rows, v, v }) |n| a.add(@as(i64, @intCast(n)));
++            a.add(@as(i32, 1)); // fp32
++            return x.launch(x.k.argmax_fn, @intCast(rows), 1024, &a);
++        }
++        a.add(src);
++        a.add(x.logits16.ptr);
++        a.add(@as(u64, rows * v));
++        try x.launch(x.k.to_bf16_fn, @intCast(@max(1, @min((rows * v + 255) / 256, 65535))), 256, &a);
++        const meta = [4]i32{ @intCast(position0 - 1), 0, 0, 0 };
++        const mp = x.meta.ptr + meta_at * 16;
++        try x.m.up(mp, std.mem.asBytes(&meta));
++        try x.k.draws.draw(x.m.stream, x.logits16.ptr, v, l.rule, mp, 0, x.tok.ptr + at * 4, rows, null, null);
++    }
++
++    /// The slot's full rows now hold `tokens` at p0.. (and nothing it knows of past them).
++    fn wrote(x: *Ripple, slot: usize, p0: usize, tokens: []const u32) !void {
++        const w = &x.written[slot];
++        w.shrinkRetainingCapacity(@min(w.items.len, p0));
++        if (w.items.len != p0) return; // a gap: rows below p0 came from no tokens the slot recorded
++        try w.appendSlice(x.gpa, tokens);
++    }
++
++    /// Whether `slot`'s full rows hold `tokens` from position 0.
++    fn holds(x: *const Ripple, slot: usize, tokens: []const u32) bool {
++        const w = x.written[slot].items;
++        return w.len >= tokens.len and std.mem.eql(u32, w[0..tokens.len], tokens);
++    }
++
++    /// The prompt cache's state at `at` (the pass stands there): the slot's rings, copied on every rank.
++    pub fn saveState(x: *Ripple, owner: ?*anyopaque, at: u32) !*Saved {
++        const s: *const Stream = @ptrCast(@alignCast(owner orelse return error.NoOwner));
++        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
++        if ((l.fill orelse l.len) != at) return error.NotAtMark;
++        const k = try x.gpa.create(Saved);
++        errdefer x.gpa.destroy(k);
++        k.* = .{ .id = x.next_id, .at = at, .slot = l.slot };
++        x.next_id +%= 1;
++        try x.m.keptOp(.save, l.slot, k.id, 0);
++        return k;
++    }
++
++    pub fn dropState(x: *Ripple, k: *Saved) void {
++        x.m.keptOp(.drop, 0, k.id, 0) catch |e| std.log.warn("ricursive: kept state {d} not dropped: {s}", .{ k.id, @errorName(e) });
++        x.gpa.destroy(k);
++    }
++
++    /// The free slot for `p`: the state's own, else the one sharing most of the prompt (least recent of equals).
++    fn pick(x: *const Ripple, p: []const u32, want: ?usize) ?usize {
++        if (want) |w| if (x.free[w]) return w;
++        var best: ?usize = null;
++        var best_len: usize = 0;
++        for (x.free, 0..) |f, i| if (f) {
++            const w = x.written[i].items;
++            const n = std.mem.indexOfDiff(u32, w[0..@min(w.len, p.len)], p[0..@min(w.len, p.len)]) orelse @min(w.len, p.len);
++            if (best == null or n > best_len or (n == best_len and x.used[i] < x.used[best.?])) {
++                best = i;
++                best_len = n;
++            }
++        };
++        return best;
++    }
++
++    /// A prompt pass begins: a slot, the stream's rule, a kept state restored; where its first chunk starts.
++    fn opening(x: *Ripple, s: *Stream) !*Lane {
++        const p = s.prompt();
++        if (p.len == 0) return error.EmptyPrompt;
++        if (p.len + @as(usize, s.max_new) > x.m.context) return error.PastContext;
++        const got = try x.lanes.getOrPut(x.gpa, s);
++        if (!got.found_existing) {
++            const k: ?*const Saved = if (s.reuse.saved) |sv| @ptrCast(@alignCast(sv)) else null;
++            const slot = x.pick(p, if (k) |kk| kk.slot else null) orelse {
++                x.lanes.removeByPtr(got.key_ptr);
++                return error.NoFreeSlot;
++            };
++            x.free[slot] = false;
++            x.clock += 1;
++            x.used[slot] = x.clock;
++            got.value_ptr.* = .{ .slot = slot, .last = x.slot_bufs[2 * slot].ptr, .rule = x.slot_bufs[2 * slot + 1].ptr };
++        }
++        const l = got.value_ptr;
++        l.sampled = false;
++        if (s.sampling) |sp| if (sp.temperature > 0) {
++            const r = cuda.sample.Rule.from(lanes.gpu_rule.rule(sp));
++            try x.m.up(l.rule, std.mem.asBytes(&r));
++            l.sampled = true;
++        };
++        s.cached = 0;
++        l.fill = x.resumeAt(s, l, p) catch |e| blk: {
++            std.log.warn("ricursive: kept state not resumed: {s}", .{@errorName(e)});
++            s.reuse_failed = true;
++            break :blk 0;
++        };
++        s.fill_at.store(@intCast(l.fill.?), .monotonic);
++        return l;
++    }
++
++    /// The kept state's position, resumed in the lane's slot (0: none, or not this prompt's rows any more).
++    fn resumeAt(x: *Ripple, s: *Stream, l: *const Lane, p: []const u32) !usize {
++        const saved = s.reuse.saved orelse return 0;
++        const k: *const Saved = @ptrCast(@alignCast(saved));
++        if (k.at != s.reuse.at or k.at == 0 or k.at >= p.len or !x.holds(k.slot, p[0..k.at])) {
++            s.reuse_failed = true;
++            return 0;
++        }
++        if (k.slot != l.slot) { // its slot is busy: its full rows below `at` into this one
++            try x.m.keptOp(.copy, l.slot, @intCast(k.slot), k.at);
++            x.written[l.slot].clearRetainingCapacity();
++            try x.written[l.slot].appendSlice(x.gpa, p[0..k.at]);
++        }
++        try x.m.keptOp(.restore, l.slot, k.id, 0);
++        x.written[l.slot].shrinkRetainingCapacity(k.at);
++        s.cached = k.at;
++        return k.at;
++    }
++
++    /// One chunk from `l.fill` to the next chunk end or mark; true once the prompt's last row is in.
++    fn chunk(x: *Ripple, s: *Stream, l: *Lane) !bool {
++        const p = s.prompt();
++        const at = l.fill.?;
++        if (s.isCancelled()) {
++            s.keepInterruptedPrefill(@intCast(at));
++            return error.Cancelled;
++        }
++        var end = @min(p.len, (at / prompt_rows + 1) * prompt_rows);
++        for (s.reuse.marks) |mk| if (mk > at and mk < end) {
++            end = mk;
++        };
++        const done = end == p.len;
++        try x.m.prompt(l.slot, p[at..end], at, done);
++        try x.wrote(l.slot, at, p[at..end]);
++        if (done) try x.m.logitsTo(l.last, 1);
++        s.fill_at.store(@intCast(end), .monotonic);
++        l.fill = if (done) null else end;
++        if (done) l.len = p.len;
++        if (s.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(end)) != null) hk.at(hk.ptr, s, @intCast(end));
++        return done;
++    }
++
++    fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
++        const x = self(ptr);
++        const l = try x.opening(s);
++        errdefer x.dropLane(s);
++        while (!try x.chunk(s, l)) {}
++    }
++
++    fn prefillStep(ptr: *anyopaque, s: *Stream, _: u32) anyerror!bool {
++        const x = self(ptr);
++        const going = if (x.lanes.getPtr(s)) |l| l.fill != null else false;
++        const l = if (going) x.lanes.getPtr(s).? else try x.opening(s);
++        errdefer x.dropLane(s);
++        return x.chunk(s, l);
++    }
++
++    fn cancelPrefill(ptr: *anyopaque, s: *Stream) !void {
++        const l = self(ptr).lanes.getPtr(s) orelse return;
++        if (l.fill) |at| s.keepInterruptedPrefill(@intCast(at));
++    }
++
++    fn handle(x: *Ripple) usize {
++        const h = x.next;
++        x.next += 1;
++        return @intCast(h % ring);
++    }
++
++    fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
++        const x = self(ptr);
++        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
++        if (position != l.len or l.fill != null) return error.PositionMismatch;
++        const h = x.next;
++        try x.drawRows(l, l.last, 0, 1, position, x.handle(), 0);
++        return h;
++    }
++
++    fn value(x: *Ripple, feed: be.Feed) !u32 {
++        return switch (feed) {
++            .value => |v| v,
++            .handle => |h| read(x, h),
++        };
++    }
++
++    fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
++        const x = self(ptr);
++        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
++        const t = try x.value(feed);
++        if (position != l.len + 1) return error.PositionMismatch;
++        const one = [1]u32{t};
++        try x.m.decode(&.{.{ .slot = l.slot, .p0 = l.len, .tokens = &one }});
++        try x.wrote(l.slot, l.len, &one);
++        try x.m.logitsTo(x.logits.ptr, 1);
++        l.len += 1;
++        const h = x.next;
++        try x.drawRows(l, x.logits.ptr, 0, 1, position, x.handle(), 0);
++        return h;
++    }
++
++    fn read(ptr: *anyopaque, h: u64) anyerror!u32 {
++        const x = self(ptr);
++        if (h >= x.next or x.next - h > ring) return error.NoSuchToken;
++        var out: [1]u32 = undefined;
++        try x.m.stream.synchronize();
++        try x.tok.download(@intCast((h % ring) * 4), std.mem.sliceAsBytes(&out));
++        return out[0];
++    }
++
++    fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++        const x = self(ptr);
++        var entries: [fwd.max_streams]fwd.Entry = undefined;
++        if (windows.len > fwd.max_streams) return error.RoundTooWide;
++        var total: usize = 0;
++        for (windows, 0..) |w, i| {
++            if (w.held != 0) return error.NoHeldDrafts; // no draft head: every draft comes from the host
++            if (w.parents != null) return error.ChainsOnly;
++            if (w.masks.len != 0) return error.StructuresUnsupported;
++            const l = x.lanes.getPtr(w.stream) orelse return error.UnknownStream;
++            l.base = l.len;
++            l.rows.clearRetainingCapacity();
++            try l.rows.append(x.gpa, w.pending);
++            try l.rows.appendSlice(x.gpa, w.tokens);
++            for (w.positions, 0..) |pos, r| if (pos != l.base + r + 1) return error.PositionMismatch;
++            entries[i] = .{ .slot = l.slot, .p0 = l.base, .tokens = l.rows.items };
++            total += l.rows.items.len;
++        }
++        if (total > round_rows) return error.RoundTooWide;
++        try x.m.decode(entries[0..windows.len]);
++        for (entries[0..windows.len]) |e| try x.wrote(e.slot, e.p0, e.tokens);
++        try x.m.logitsTo(x.logits.ptr, total);
++        var at: usize = 0;
++        for (windows, 0..) |w, i| {
++            const l = x.lanes.getPtr(w.stream).?;
++            try x.drawRows(l, x.logits.ptr, at, l.rows.items.len, w.positions[0], ring + at, i);
++            at += l.rows.items.len;
++        }
++        var got: [round_rows]u32 = undefined;
++        try x.m.stream.synchronize();
++        try x.tok.download(ring * 4, std.mem.sliceAsBytes(got[0..total]));
++        at = 0;
++        for (windows, out) |w, o| {
++            const l = x.lanes.getPtr(w.stream).?;
++            const n = l.rows.items.len;
++            @memcpy(o.sampled[0..n], got[at..][0..n]);
++            @memcpy(o.drafts[0 .. n - 1], l.rows.items[1..]);
++            l.len = l.base + n; // a chain keeps every row unless rolled back
++            at += n;
++        }
++    }
++
++    fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++        const x = self(ptr);
++        for (windows, paths) |w, path| {
++            const l = x.lanes.getPtr(w.stream) orelse return error.UnknownStream;
++            if (path.len == 0 or path.len > l.rows.items.len) return error.EmptyPath;
++            for (path, 0..) |r, i| if (r != i) return error.ChainsOnly; // a chain keeps a prefix of its rows
++            l.len = l.base + path.len; // caches are positional: later rows overwrite what the rejected ones wrote
++            x.written[l.slot].shrinkRetainingCapacity(@min(x.written[l.slot].items.len, l.len));
++        }
++    }
++
++    /// No draft head is loaded: absorbing is a no-op, and a request for drafts is refused by name.
++    fn draft(_: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++        for (requests) |r| if (r.depth != 0 or r.lanes != null) return error.NoDraftHead;
++    }
++
++    fn dropLane(x: *Ripple, s: *const Stream) void {
++        if (x.lanes.fetchRemove(s)) |entry| {
++            var l = entry.value;
++            x.free[l.slot] = true;
++            l.rows.deinit(x.gpa);
++        }
++    }
++
++    fn release(ptr: *anyopaque, s: *Stream) void {
++        self(ptr).dropLane(s);
++    }
++};
++
++test "a slot's recorded rows: a write past a gap records nothing, a rewrite cuts what followed" {
++    var w: std.ArrayList(u32) = .empty;
++    defer w.deinit(std.testing.allocator);
++    try w.appendSlice(std.testing.allocator, &.{ 1, 2, 3, 4 });
++    w.shrinkRetainingCapacity(@min(w.items.len, 2));
++    try w.appendSlice(std.testing.allocator, &.{9});
++    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 9 }, w.items);
++}
+diff --git a/zig/src/families/ricursive/cuda_native.zig b/zig/src/families/ricursive/cuda_native.zig
+new file mode 100644
+index 000000000..f25057fc0
+--- /dev/null
++++ b/zig/src/families/ricursive/cuda_native.zig
+@@ -0,0 +1,177 @@
++//! Ripple (ricursive) behind the native CUDA registry: rank 0 serves, rank 1 runs `tf-ricursive follow`.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const fwd = @import("cuda_forward.zig");
++const rl = @import("cuda_lanes.zig");
++const kept = @import("cuda_kept.zig");
++const family = @import("cuda.zig");
++
++pub const model_type = "ricursive";
++pub const formats: []const []const u8 = &.{"exl3"};
++/// The publisher's served window (config.json allows 2M): one stream at 1M by default.
++pub const default_context: i64 = 1048576;
++pub const max_segments: u32 = 1;
++pub const prompt_rows: u32 = rl.prompt_rows;
++/// A kept state holds the caches through its position and nothing past it (no draft head reads a token on).
++pub const snap_lookahead: u32 = 0;
++pub const takes_drafter = false;
++pub const drafter_refusal = "--drafter: Ripple on CUDA loads no drafter yet; serve it without --drafter";
++pub const explains_open = true;
++/// A request's verify reserve past its prompt and reply.
++pub const window_rows: u32 = rl.round_rows;
++pub const weightShare = family.weightShare;
++
++pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
++pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, lanes_fixed: bool = false, room: ?Room = null };
++
++pub const Loaded = struct {
++    backend: lanes.backend.Backend,
++    facts: lanes.Model,
++    rows: u32,
++    stream_bytes: usize,
++    free_streams: u32,
++    ctx: *anyopaque,
++    deinit: *const fn (*anyopaque) void,
++    target: *rl.Ripple, // the prompt cache keeps this backend's states (snap_*)
++};
++
++const Owned = struct { gpa: std.mem.Allocator, m: *fwd.Model, r: rl.Ripple };
++
++fn on(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++fn off(name: [*:0]const u8) bool {
++    const v = std.c.getenv(name) orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++/// Slots to allocate in `room` (`per` bytes a slot past `fixed`): as asked, else (not fixed) the most that fit.
++fn fit(room: u64, asked: u32, fixed: bool, per: u64, fixed_bytes: u64) !usize {
++    if (asked > fwd.max_streams) return error.ParallelPastRound;
++    var n: usize = @max(asked, 1);
++    while (fixed_bytes + n * per > room) : (n -= 1) {
++        if (fixed) return error.ParallelPastMemory;
++        if (n == 1) return error.NoStreamFits;
++    }
++    return n;
++}
++
++/// Rank 0's model and lanes; TP=2 at TF_RICURSIVE_RANK=0, TF_RICURSIVE_WORLD=2 and NCCL_COMM_ID.
++pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
++    if (kernels != null) return error.CapturedKernels;
++    const p = try fwd.place();
++    try fwd.admit(try ctx.capability(), p.world);
++    if (p.rank != 0) return error.RicursiveFollowerServes;
++    const own = try gpa.create(Owned);
++    errdefer gpa.destroy(own);
++    own.gpa = gpa;
++    // every slot's caches are allocated at load: plan them inside the room the weights leave (a rank's share)
++    const c = try readConfig(gpa, io, dir);
++    const hk = c.kv_heads / p.world;
++    const per = fwd.Model.cacheBytes(c, hk, o.context, 1);
++    const room: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
++    const fixed = family.weightShare(gpa, io, dir, try shardBytes(gpa, io, dir)) + (3 << 30); // weights, scratch
++    const slots = fit(room, o.lanes, o.lanes_fixed, per, fixed) catch |e| {
++        std.log.err("ricursive: {d} slot(s) at {d} tokens need {d:.2} GiB a rank with the weights and the CUDA memory budget leaves {d:.2} GiB", .{ o.lanes, o.context, gib(per * @max(o.lanes, 1) + fixed), gib(room) });
++        return e;
++    };
++    own.m = try fwd.Model.load(gpa, io, ctx, ctx.d, dir, .{ .context = o.context, .slots = slots, .place = p, .full_prompt = !off("TF_RICURSIVE_FULL_PROMPT"), .roce = on("TF_RICURSIVE_ROCE"), .graphs = on("TF_RICURSIVE_GRAPHS") });
++    errdefer own.m.deinit();
++    own.r = try rl.Ripple.init(gpa, own.m);
++    own.r.priority_copies = try cuda.priority_copies.read("TF_RICURSIVE_COPIES", o.drafts);
++    std.log.info("ricursive: rank 0 of {d}, {d} slot(s) x {d} tokens, {d:.2} GiB of caches a rank, graphs {}, RoCE {}", .{ p.world, slots, o.context, gib(per * slots), own.m.o.graphs, own.m.o.roce });
++    return .{
++        .backend = own.r.backend(),
++        .facts = own.r.facts(),
++        .rows = rl.round_rows,
++        .stream_bytes = per,
++        .free_streams = @intCast(slots),
++        .ctx = own,
++        .deinit = release,
++        .target = &own.r,
++    };
++}
++
++fn shardBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
++    const core = @import("core");
++    const files = try core.checkpoint.shardFiles(a, io, dir);
++    defer core.checkpoint.freeShardFiles(a, files);
++    var total: u64 = 0;
++    for (files) |f| total += (try std.Io.Dir.cwd().statFile(io, f, .{})).size;
++    return total;
++}
++
++fn readConfig(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !family.config.Config {
++    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++    defer gpa.free(path);
++    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++    defer gpa.free(bytes);
++    return family.config.parse(gpa, bytes);
++}
++
++fn gib(bytes: u64) f64 {
++    return @as(f64, @floatFromInt(bytes)) / (1 << 30);
++}
++
++fn ripple(ptr: *anyopaque) *rl.Ripple {
++    return @ptrCast(@alignCast(ptr));
++}
++
++/// Bytes a state takes on each rank: one slot's sliding rings (the full layers' rows stay in the slot).
++pub fn snap_bytes(ptr: *anyopaque, _: u32) u64 {
++    return kept.bytes(ripple(ptr).m);
++}
++
++/// The prompt pass stands at `at` (a chunk end at a mark): every rank copies the slot's rings under one new id.
++pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
++    return @ptrCast(try ripple(ptr).saveState(owner, at));
++}
++
++/// States resume inside a prompt pass (Ripple.opening), where every rank restores the same slot.
++pub fn snap_restore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
++    return error.RestoredInPromptPass;
++}
++
++pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
++    ripple(ptr).dropState(@ptrCast(@alignCast(saved)));
++}
++
++/// A request or load this engine refuses, in words; null: none of its own.
++pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
++    return switch (err) {
++        error.PastContext => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
++        error.NoFreeSlot => "every stream's caches are in use: retry once another request ends",
++        error.NoDraftHead => "Ripple on CUDA has no draft head yet: drafts come from the prompt's own text only",
++        error.StructuresUnsupported => "structured output is not built for Ripple on CUDA yet",
++        error.CapturedKernels => "Ripple runs on the engine's own kernels: unset TENSORFOLD_CUDA_KERNELS",
++        error.RicursiveFollowerServes => "Ripple's rank 1 runs `tf-ricursive follow <pack>` (TF_RICURSIVE_RANK=1), not the server",
++        error.RicursiveRequiresSm121 => "Ripple on CUDA runs on GB10 (sm_121) only so far, and this GPU is another",
++        error.RicursiveTpNotValidated => "Ripple on CUDA runs at one rank or two only: TF_RICURSIVE_WORLD=1 or 2",
++        error.BadSetting => "TF_RICURSIVE_RANK and TF_RICURSIVE_WORLD go together (rank 0 of 2 serves)",
++        error.ParallelPastRound => "--parallel: Ripple on CUDA holds at most 16 streams",
++        error.ParallelPastMemory => "--parallel: the CUDA memory budget fits fewer Ripple streams than asked at this --context: lower --parallel or --context, or adjust TENSORFOLD_MEMORY_RESERVE_GIB",
++        error.NoStreamFits => "the CUDA memory budget fits no Ripple stream after the weights: lower --context, or adjust TENSORFOLD_MEMORY_RESERVE_GIB",
++        error.RicursiveRanksDisagree => "Ripple's ranks serve different slots or contexts: give rank 1 TF_RICURSIVE_SLOTS and TF_RICURSIVE_CONTEXT equal to --parallel and --context",
++        else => null,
++    };
++}
++
++fn release(p: *anyopaque) void {
++    const own: *Owned = @ptrCast(@alignCast(p));
++    own.m.stop() catch {};
++    own.r.deinit();
++    own.m.deinit();
++    own.gpa.destroy(own);
++}
++
++test "the slots allocated at open fit the room: auto takes what fits, a fixed count refuses" {
++    const g: u64 = 1 << 30;
++    try std.testing.expectEqual(@as(usize, 2), try fit(10 * g, 4, false, 4 * g, g));
++    try std.testing.expectError(error.ParallelPastMemory, fit(10 * g, 4, true, 4 * g, g));
++    try std.testing.expectError(error.NoStreamFits, fit(g, 1, false, 4 * g, g));
++    try std.testing.expectError(error.ParallelPastRound, fit(1000 * g, 17, false, g, 0));
++    try std.testing.expect(explain(null, error.PastContext) != null and explain(null, error.OutOfMemory) == null);
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index d54e50bdd..4a1182e92 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -30,7 +30,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
+ const drafted = @import("cuda_drafted.zig");
+ const kv_pages = @import("cuda_kv_pool.zig");
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native };
++const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("ricursive_cuda").native };
+ /// --record opens here (engines.zig refuses it for a backend without this).
+ pub const records = true;
+ pub const backends: []const []const u8 = &.{"cuda"};
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index 8c216c132..90fccdd35 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -9,6 +9,14 @@ pub const Markers = struct { open: []const u8, close: []const u8 };
+ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
+ /// MiniMax-M3's adaptive thinking: the reply writes `<mm:think>...</mm:think>` itself, or `</mm:think>` alone.
+ pub const mm_markers: Markers = .{ .open = "", .close = "</mm:think>" };
++/// A reply that opens its own think block or none (Ripple's): text without a leading `<think>` is all answer.
++pub const reply_think_markers: Markers = .{ .open = "<think>", .close = "</think>" };
++
++/// Whether a template keeps a reply's reasoning in the reply's own leading `<think>` block (it tests content for one).
++pub fn repliesOpenThink(source: []const u8) bool {
++    return std.mem.indexOf(u8, source, "startswith('<think>')") != null or std.mem.indexOf(u8, source, "startswith(\"<think>\")") != null;
++}
++
+ /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's and MiniMax-M3's do).
+ const think_open = "<think>";
+ 
+diff --git a/zig/src/server/reply_think_test.zig b/zig/src/server/reply_think_test.zig
+new file mode 100644
+index 000000000..87d28741e
+--- /dev/null
++++ b/zig/src/server/reply_think_test.zig
+@@ -0,0 +1,23 @@
++//! Replies that open their own think block (Ripple's template): the split and its template detection.
++const std = @import("std");
++const rt = @import("reply_text.zig");
++
++test "a reply that opens its own think block splits there, and one that opens none is all answer" {
++    const a = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const x = arena.allocator();
++    const m = rt.reply_think_markers;
++    const plain = try rt.splitThinking(x, "Paris.", true, m);
++    try std.testing.expectEqualStrings("", plain.reasoning);
++    try std.testing.expectEqualStrings("Paris.", plain.answer);
++    const both = try rt.splitThinking(x, "<think>\nThe capital.\n</think>\nParis.", true, m);
++    try std.testing.expectEqualStrings("The capital.\n", both.reasoning);
++    try std.testing.expectEqualStrings("Paris.", both.answer);
++    const call = try rt.splitThinking(x, "<think>\nUse the tool.\n</think>\n\n<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>", true, m);
++    try std.testing.expectEqualStrings("<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>", call.answer);
++    const held = try rt.splitThinking(x, "<thi", false, m); // while it may still be the opener, nothing shows
++    try std.testing.expectEqualStrings("", held.answer);
++    try std.testing.expect(rt.repliesOpenThink("{%- if not content.lstrip().startswith('<think>') %}"));
++    try std.testing.expect(!rt.repliesOpenThink("{{- '<|im_start|>assistant\\n<think>\\n' }}"));
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 2e585d453..a53afecfc 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -45,6 +45,7 @@ test {
+     _ = @import("std_options.zig");
+     _ = @import("fields.zig");
+     _ = @import("reply_text.zig");
++    _ = @import("reply_think_test.zig");
+     _ = @import("tool_parse.zig");
+     _ = @import("tool_lfm2.zig");
+     _ = @import("tool_lfm2_stream_test.zig");
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 6c8ec7f37..440135e2c 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -207,6 +207,7 @@ pub const Server = struct {
+         if (minimax) srv.markers = reply_text.mm_markers;
+         srv.close_id = text.tokenId(srv.markers.close);
+         const source = text.templateSource();
++        if (srv.markers.open.len == 0 and std.mem.eql(u8, srv.markers.close, "</think>") and reply_text.repliesOpenThink(source)) srv.markers = reply_text.reply_think_markers;
+         srv.effort_levels = try fields.effortLevels(a, source);
+         // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
+         srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
+diff --git a/zig/tests/ricursive_cuda.zig b/zig/tests/ricursive_cuda.zig
+index 13bc81012..3d72a7d06 100644
+--- a/zig/tests/ricursive_cuda.zig
++++ b/zig/tests/ricursive_cuda.zig
+@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
+     const io = init.io;
+     var t0 = now(io);
+     const context = if (std.c.getenv("TF_RICURSIVE_CONTEXT")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 4096;
+-    const m = try rc.Model.load(init.gpa, init.io, &ctx, &driver, args[1], .{ .context = context, .truncated = truncated, .place = pl, .full_prompt = !off("TF_RICURSIVE_FULL_PROMPT"), .roce = env("TF_RICURSIVE_ROCE"), .graphs = env("TF_RICURSIVE_GRAPHS") });
++    const m = try rc.Model.load(init.gpa, init.io, &ctx, &driver, args[1], .{ .context = context, .slots = if (std.c.getenv("TF_RICURSIVE_SLOTS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1, .truncated = truncated, .place = pl, .full_prompt = !off("TF_RICURSIVE_FULL_PROMPT"), .roce = env("TF_RICURSIVE_ROCE"), .graphs = env("TF_RICURSIVE_GRAPHS") });
+     defer m.deinit();
+     std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB of weights in {d:.1} s; device {d:.2} GiB allocated; context {d}; MemAvailable {d:.1} GiB\n", .{ pl.rank, pl.world, m.c.layers, gib(m.w.bytes), now(io) - t0, gib(cuda.usage(false).device), context, memAvailable(io) });
+     if (pl.rank != 0) {
+-- 
+2.53.0
+
