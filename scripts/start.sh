@@ -21,6 +21,7 @@ TAG="serve $NAME :$PORT $(date -Is)"
 [[ -f $MODEL_DIR/config.json ]] || die "no pack at $MODEL_DIR"
 for W in "${W_LIST[@]}"; do ssh -n "$W" "test -f $MODEL_DIR/config.json" || die "$W has no pack at $MODEL_DIR"; done
 ss -ltn "( sport = :$PORT )" | grep -q LISTEN && die "port $PORT is taken"
+mkdir -p "$(dirname "$LOCK")"
 ( set -o noclobber; echo "$TAG" > "$LOCK" ) 2> /dev/null || die "head GPU busy: $(cat "$LOCK")"
 LOCKED=()
 fail() {
@@ -29,7 +30,7 @@ fail() {
   rm -f "$LOCK"; die "$@"
 }
 for W in "${W_LIST[@]}"; do
-  ssh -n "$W" "( set -o noclobber; echo '$TAG' > ~/ripple/gpu.lock ) 2> /dev/null" || fail "$W GPU busy: $(ssh -n "$W" cat ~/ripple/gpu.lock)"
+  ssh -n "$W" "mkdir -p ~/ripple; ( set -o noclobber; echo '$TAG' > ~/ripple/gpu.lock ) 2> /dev/null" || fail "$W GPU busy: $(ssh -n "$W" cat ~/ripple/gpu.lock)"
   LOCKED+=("$W")
 done
 # the same build on every node
