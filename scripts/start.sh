@@ -49,10 +49,12 @@ if (( WORLD > 2 )) && [[ $ROCE == 1 ]]; then
     log "no $BIN/lib/tp_mailbox.fatbin: NCCL carries every gather (scripts/zig_prepare.sh builds it)"
   fi
 fi
+read -ra RH <<< "$RANK_HCAS"
+hcas() { local h=${RH[$1]:--}; [[ $h == - ]] && h=$NCCL_HCAS; echo "$h"; } # RANK: its RoCE devices
 run_args() { # RANK: every rank's container settings (NCCL over the CX7 RoCE link, as MiMo's recipe)
   echo "--gpus all --ipc=host --network host --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1" \
     "--user $(id -u):$(id -g) -e HOME=/tmp -v $MODEL_DIR:$MODEL_DIR:ro -v $D:$D:ro" \
-    "-e NCCL_COMM_ID=$MASTER:$TP_PORT -e NCCL_SOCKET_IFNAME=$NCCL_IFNAME -e NCCL_IB_HCA=$NCCL_HCAS" \
+    "-e NCCL_COMM_ID=$MASTER:$TP_PORT -e NCCL_SOCKET_IFNAME=$NCCL_IFNAME -e NCCL_IB_HCA=$(hcas "$1")" \
     "-e NCCL_IB_GID_INDEX=$NCCL_GID -e TF_ROCE_GID_INDEX=$NCCL_GID -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4" \
     "-e TF_RICURSIVE_RANK=$1 -e TF_RICURSIVE_WORLD=$WORLD -e TF_RICURSIVE_CONTEXT=$CONTEXT -e TF_RICURSIVE_SLOTS=$STREAMS" \
     "-e TF_RICURSIVE_GRAPHS=$GRAPHS -e TF_RICURSIVE_ROCE=$ROCE -e TENSORFOLD_MEMORY_RESERVE_GIB=$MEM_RESERVE_GIB $WIRE ${EXTRA_ENV:-}"

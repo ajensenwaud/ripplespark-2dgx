@@ -56,6 +56,7 @@ COPIES="${COPIES:-1}"                         # 0: no prompt-copy (n-gram) draft
 # --- NCCL over the CX7 link (as MiMo's recipe) -------------------------------------------------------------------
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f0np0}"
 NCCL_HCAS="${NCCL_HCAS:-rocep1s0f0,roceP2p1s0f0}"
+RANK_HCAS="${RANK_HCAS:-}"                    # per rank, space-separated, "-" for NCCL_HCAS: for nodes whose RoCE devices are named otherwise (mlx5_0,...)
 NCCL_GID="${NCCL_GID:-3}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
