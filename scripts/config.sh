@@ -34,7 +34,7 @@ IMAGE="${IMAGE:-ripple-tf}"
 TF_REPO="https://github.com/ashhart/TensorFold"
 TF_TAG="v1.2.3"
 TF_COMMIT="6ec5fa4cb233f3606acbdad5bec433f0f8758f96"
-ZIG_TREE="${ZIG_TREE:-326a0a51a1c30f2fc59468a1b2f9c2cd6af34aee}"                     # tree hash of v1.2.3 + patches-zig/ (scripts/zig_prepare.sh checks it)
+ZIG_TREE="${ZIG_TREE:-de18a25b239d23fce3cb428db4a0a8c703e4c845}"                     # tree hash of v1.2.3 + patches-zig/ (scripts/zig_prepare.sh checks it)
 ZIG_DIR="${ZIG_DIR:-$HOME/ripple/tensorfold}"
 ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-ripple-zig-build:0.17.0}"
 
