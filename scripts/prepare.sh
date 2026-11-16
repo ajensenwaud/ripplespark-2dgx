@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pull the base, build the ripple-tf image on the head (rank 0), then copy it to the worker over CX7.
+# Pull the base, build the ripple-tf image on the head (rank 0), then copy it to every worker over CX7.
 # Nothing is installed on the hosts.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,8 +12,10 @@ DOCKER_BUILDKIT=0 docker build -q -t "$IMAGE:latest" --build-arg BASE_IMAGE="$BA
 # save/load under the containerd store changes the image ID, so compare the layer digests
 LAYERS='{{range .RootFS.Layers}}{{println .}}{{end}}'
 SUM=$(docker image inspect "$IMAGE:latest" --format "$LAYERS" | sha256sum | cut -c1-16)
-log "built $SUM; copying to $WORKER"
-docker save "$IMAGE:latest" | gzip -1 | ssh "$WORKER" 'gunzip | docker load -q'
-[[ "$(ssh -n "$WORKER" "docker image inspect $IMAGE:latest --format '$LAYERS'" | sha256sum | cut -c1-16)" == "$SUM" ]] \
-  || die "worker image layers differ"
-log "ready on both nodes: layers $SUM"
+for W in "${W_LIST[@]}"; do
+  log "built $SUM; copying to $W"
+  docker save "$IMAGE:latest" | gzip -1 | ssh "$W" 'gunzip | docker load -q'
+  [[ "$(ssh -n "$W" "docker image inspect $IMAGE:latest --format '$LAYERS'" | sha256sum | cut -c1-16)" == "$SUM" ]] \
+    || die "$W image layers differ"
+done
+log "ready on $WORLD nodes: layers $SUM"

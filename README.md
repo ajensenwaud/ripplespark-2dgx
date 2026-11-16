@@ -26,6 +26,27 @@ To make it yourself: `scripts/quantise.sh 5.0` (about 6 h on one GB10).
 Settings in `scripts/config.sh` (override in `scripts/local.sh`): `PACK=5.0|6.0`, `CONTEXT=1048576`, `STREAMS=1`
 (or `STREAMS=4 CONTEXT=262144` for four agents at once), `DRAFTER=1|0`.
 
+## Four Sparks
+
+The same scripts serve Ripple across four Sparks with TP=4, each on one CX7 link to a QSFP switch with RoCE. In
+`scripts/local.sh`, name the three workers in rank order instead of `WORKER`, and set the switch's GID index:
+
+```bash
+WORKERS="user@192.0.2.2 user@192.0.2.3 user@192.0.2.4"
+MASTER=192.0.2.1
+NCCL_GID=5                        # RoCE v2 over IPv4 on the switch (3 on a direct cable)
+RANK_HCAS="- mlx5_0,mlx5_2 - -"   # only if a Spark names its RoCE devices otherwise
+```
+
+Four Sparks also use ports 29700-29707 for the small gathers. One stream of 1M tokens, `STREAMS=8 CONTEXT=262144`
+or `STREAMS=16 CONTEXT=131072`.
+
+Patches 0011-0015 speed up prompt reading and many streams at once, on two Sparks as well as four. With them, four
+Sparks decode 17.6 tok/s plain and 57.4 with DFlash2 on one coding stream, 229 tok/s in total across 16 streams,
+and read prompts at about 1,100 tok/s (a 1M-token prompt in 47 min); two Sparks read at about 610 tok/s. At greedy
+decoding, four Sparks give byte-identical replies to two. Details and measurements:
+[zrresearch/ripplespark-4dgx](https://github.com/zrresearch/ripplespark-4dgx).
+
 ## Models
 
 Same source and exllamav3 settings (`-cr 250 -cc 2048`, mul1 codebook, head 8 bits, embedding 16 bits); only the

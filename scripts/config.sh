@@ -1,11 +1,13 @@
-# RippleSpark: Ripple-65B-Preview on two DGX Sparks via TensorFold. Shared settings; override in scripts/local.sh
+# RippleSpark: Ripple-65B-Preview on two or four DGX Sparks via TensorFold. Shared settings; override in scripts/local.sh
 # (gitignored).
 # shellcheck disable=SC2034
 
 # --- nodes -------------------------------------------------------------------------------------------------------
 WORKER="${WORKER:-}"                          # rank 1: ssh target over the CX7 link (user@address); set in scripts/local.sh
+WORKERS="${WORKERS:-}"                        # ranks 1.. in order, space-separated: three for four Sparks (default: WORKER)
 MASTER="${MASTER:-}"                          # rank 0's CX7 address; set in scripts/local.sh
 TP_PORT="${TP_PORT:-29681}"                  # MiMo 29661, GLM 29551, Kolibri 29561
+TP_WIRE_PORT="${TP_WIRE_PORT:-29700}"        # four Sparks, ROCE=1: fabric/tp's multirank wire (it takes this port to +7)
 
 # --- checkpoints -------------------------------------------------------------------------------------------------
 SRC_REPO="ricursiveAI/Ripple-65B-Preview"
@@ -32,7 +34,7 @@ IMAGE="${IMAGE:-ripple-tf}"
 TF_REPO="https://github.com/ashhart/TensorFold"
 TF_TAG="v1.2.3"
 TF_COMMIT="6ec5fa4cb233f3606acbdad5bec433f0f8758f96"
-ZIG_TREE="${ZIG_TREE:-4fdee39b1c2582f677385118f2697b30850216bf}"                     # tree hash of v1.2.3 + patches-zig/ (scripts/zig_prepare.sh checks it)
+ZIG_TREE="${ZIG_TREE:-de18a25b239d23fce3cb428db4a0a8c703e4c845}"                     # tree hash of v1.2.3 + patches-zig/ (scripts/zig_prepare.sh checks it)
 ZIG_DIR="${ZIG_DIR:-$HOME/ripple/tensorfold}"
 ZIG_BUILD_IMAGE="${ZIG_BUILD_IMAGE:-ripple-zig-build:0.17.0}"
 
@@ -48,16 +50,24 @@ MAX_TOKENS="${MAX_TOKENS:-32768}"            # a reply's ceiling when a request 
 MEM_RESERVE_GIB="${MEM_RESERVE_GIB:-4}"
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"      # empty: the engine's default (16 GiB, within the room left)
 GRAPHS="${GRAPHS:-1}"                         # decode rows as CUDA graphs (byte-identical to eager)
-ROCE="${ROCE:-1}"                             # the ranks' small gathers by RoCE writes (byte-identical to NCCL)
+ROCE="${ROCE:-1}"                             # the ranks' small gathers by RoCE writes (byte-identical to NCCL; four Sparks: the multirank wire)
 DRAFTER="${DRAFTER:-1}"                       # 1 (default): the publisher's DFlash2 drafter (BF16, cut over both ranks); 0: copies only
 COPIES="${COPIES:-1}"                         # 0: no prompt-copy (n-gram) drafts (TF_RICURSIVE_COPY_DRAFTS=0)
 # --- NCCL over the CX7 link (as MiMo's recipe) -------------------------------------------------------------------
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f0np0}"
 NCCL_HCAS="${NCCL_HCAS:-rocep1s0f0,roceP2p1s0f0}"
+RANK_HCAS="${RANK_HCAS:-}"                    # per rank, space-separated, "-" for NCCL_HCAS: for nodes whose RoCE devices are named otherwise (mlx5_0,...)
 NCCL_GID="${NCCL_GID:-3}"
 
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 [[ -f "$(dirname "${BASH_SOURCE[0]}")/local.sh" ]] && source "$(dirname "${BASH_SOURCE[0]}")/local.sh"
-need_pair() { [[ -n "$WORKER" && -n "$MASTER" ]] || die "set WORKER and MASTER in scripts/local.sh"; }
+# need_pair: WORKERS (or WORKER) and MASTER set; W_LIST the workers in rank order, WORLD the Sparks (2 or 4)
+need_pair() {
+  WORKERS=${WORKERS:-$WORKER}
+  [[ -n "$WORKERS" && -n "$MASTER" ]] || die "set WORKER (two Sparks) or WORKERS (four) and MASTER in scripts/local.sh"
+  read -ra W_LIST <<< "$WORKERS"
+  WORLD=$((1 + ${#W_LIST[@]}))
+  (( WORLD == 2 || WORLD == 4 )) || die "Ripple runs on two or four Sparks; WORKERS names ${#W_LIST[@]}"
+}
 true

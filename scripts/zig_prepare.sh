@@ -31,10 +31,13 @@ rm -rf "$ZIG_DIR/zig-out"
 mkdir -p "$CACHE_DIR/zig"
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e ZIG_GLOBAL_CACHE_DIR=/zc -v "$CACHE_DIR/zig:/zc" \
   -v "$ZIG_DIR:/w" -w /w "$ZIG_BUILD_IMAGE" bash -c \
-  'git config --global --add safe.directory /w; zig build native ricursive-cuda -Doptimize=fast -Dnvcc=$(which nvcc) -Dsm=121'
-[[ -x zig-out/native/bin/tensorfold-native && -x zig-out/bin/tf-ricursive ]] || die "build incomplete"
+  'git config --global --add safe.directory /w; zig build native ricursive-cuda -Doptimize=fast -Dnvcc=$(which nvcc) -Dsm=121 &&
+   mkdir -p zig-out/lib && nvcc -fatbin -O3 -std=c++17 -gencode=arch=compute_121,code=sm_121 -o zig-out/lib/tp_mailbox.fatbin zig/src/fabric/tp/mailbox.cu'
+[[ -x zig-out/native/bin/tensorfold-native && -x zig-out/bin/tf-ricursive && -f zig-out/lib/tp_mailbox.fatbin ]] || die "build incomplete"
 
 # 4. the same build on the worker
-ssh "$WORKER" "mkdir -p $ZIG_DIR" </dev/null
-rsync -a --delete zig-out/ "$WORKER:$ZIG_DIR/zig-out/"
-log "built $(git rev-parse --short HEAD) (tree $TREE) in $ZIG_DIR/zig-out on both nodes; start it with scripts/start.sh"
+for W in "${W_LIST[@]}"; do
+  ssh "$W" "mkdir -p $ZIG_DIR" </dev/null
+  rsync -a --delete zig-out/ "$W:$ZIG_DIR/zig-out/"
+done
+log "built $(git rev-parse --short HEAD) (tree $TREE) in $ZIG_DIR/zig-out on all $WORLD nodes; start it with scripts/start.sh"
